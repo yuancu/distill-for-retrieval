@@ -14,10 +14,25 @@ logger = logging.getLogger(__name__)
 
 
 def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
-    """Phase 1: General distillation with MSE + Cosine loss"""
+    """Phase 1: General distillation with MSE + Cosine loss
+
+    Supports two modes:
+    - With projection: Student (768d) -> Projection -> Teacher (3584d)
+    - Without projection (MRL): Student (768d) -> Teacher's first 768d
+    """
     logger.info("=" * 80)
     logger.info("Starting Phase 1: General Distillation")
     logger.info("=" * 80)
+
+    # Get distillation target dimension
+    target_dim = student_model.get_output_dim()
+    use_projection = student_model.use_projection
+    logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
+    logger.info(f"Target dimension: {target_dim}")
+
+    # Get tokenizer from student model
+    tokenizer = student_model.student.tokenizer
+    max_length = config.get('max_length', 512)
 
     # Load dataset
     max_samples = config.get('max_samples_per_dataset', 100000)
@@ -69,31 +84,56 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
             queries = batch['query']
             passages = batch['passage']
 
+            # Tokenize inputs
+            query_inputs = tokenizer(
+                queries,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            ).to(device)
+
+            passage_inputs = tokenizer(
+                passages,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            ).to(device)
+
             # Encode with teacher (frozen)
             with torch.no_grad():
                 teacher_query_emb = teacher_model.encode(
                     queries,
                     convert_to_tensor=True,
                     normalize_embeddings=True
-                ).to(device)
+                ).to(device).clone()  # Clone to convert from inference mode tensor
 
                 teacher_passage_emb = teacher_model.encode(
                     passages,
                     convert_to_tensor=True,
                     normalize_embeddings=True
-                ).to(device)
+                ).to(device).clone()  # Clone to convert from inference mode tensor
 
-            # Encode with student (trainable)
-            student_query_emb = student_model.encode(
-                queries,
-                normalize=True,
-                return_projected=True
+                # Slice teacher embeddings to target dimension if not using projection (MRL)
+                if not use_projection:
+                    teacher_query_emb = teacher_query_emb[:, :target_dim]
+                    teacher_passage_emb = teacher_passage_emb[:, :target_dim]
+                    # Re-normalize after slicing
+                    teacher_query_emb = torch.nn.functional.normalize(teacher_query_emb, p=2, dim=-1)
+                    teacher_passage_emb = torch.nn.functional.normalize(teacher_passage_emb, p=2, dim=-1)
+
+            # Encode with student using forward() for proper gradient flow
+            _, student_query_emb = student_model(
+                query_inputs['input_ids'],
+                query_inputs['attention_mask'],
+                normalize=True
             )
 
-            student_passage_emb = student_model.encode(
-                passages,
-                normalize=True,
-                return_projected=True
+            _, student_passage_emb = student_model(
+                passage_inputs['input_ids'],
+                passage_inputs['attention_mask'],
+                normalize=True
             )
 
             # Compute loss for both queries and passages
@@ -142,10 +182,25 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
 
 
 def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
-    """Phase 2: Task-specific training with InfoNCE + MSE"""
+    """Phase 2: Task-specific training with InfoNCE + MSE
+
+    Supports two modes:
+    - With projection: Student (768d) -> Projection -> Teacher (3584d)
+    - Without projection (MRL): Student (768d) -> Teacher's first 768d
+    """
     logger.info("\n" + "=" * 80)
     logger.info("Starting Phase 2: Task-Specific Training")
     logger.info("=" * 80)
+
+    # Get distillation target dimension
+    target_dim = student_model.get_output_dim()
+    use_projection = student_model.use_projection
+    logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
+    logger.info(f"Target dimension: {target_dim}")
+
+    # Get tokenizer from student model
+    tokenizer = student_model.student.tokenizer
+    max_length = config.get('max_length', 512)
 
     # Load dataset
     max_samples = config.get('max_samples', 500000)
@@ -208,18 +263,34 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
                 docs = [positives[i]] + negatives_list[i]
                 all_docs.append(docs)
 
-            # Encode queries
+            # Tokenize queries
+            query_inputs = tokenizer(
+                queries,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            ).to(device)
+
+            # Encode queries with teacher (frozen)
             with torch.no_grad():
                 teacher_query_emb = teacher_model.encode(
                     queries,
                     convert_to_tensor=True,
                     normalize_embeddings=True
-                ).to(device)
+                ).to(device).clone()  # Clone to convert from inference mode tensor
 
-            student_query_emb = student_model.encode(
-                queries,
-                normalize=True,
-                return_projected=True
+                # Slice teacher embeddings to target dimension if not using projection (MRL)
+                if not use_projection:
+                    teacher_query_emb = teacher_query_emb[:, :target_dim]
+                    # Re-normalize after slicing
+                    teacher_query_emb = torch.nn.functional.normalize(teacher_query_emb, p=2, dim=-1)
+
+            # Encode queries with student using forward()
+            _, student_query_emb = student_model(
+                query_inputs['input_ids'],
+                query_inputs['attention_mask'],
+                normalize=True
             )
 
             # Encode documents
@@ -227,18 +298,36 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
             student_doc_embs = []
 
             for docs in all_docs:
+                # Tokenize documents
+                doc_inputs = tokenizer(
+                    docs,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt'
+                ).to(device)
+
+                # Encode with teacher (frozen)
                 with torch.no_grad():
                     teacher_docs = teacher_model.encode(
                         docs,
                         convert_to_tensor=True,
                         normalize_embeddings=True
-                    ).to(device)
+                    ).to(device).clone()  # Clone to convert from inference mode tensor
+
+                    # Slice teacher embeddings to target dimension if not using projection (MRL)
+                    if not use_projection:
+                        teacher_docs = teacher_docs[:, :target_dim]
+                        # Re-normalize after slicing
+                        teacher_docs = torch.nn.functional.normalize(teacher_docs, p=2, dim=-1)
+
                     teacher_doc_embs.append(teacher_docs)
 
-                student_docs = student_model.encode(
-                    docs,
-                    normalize=True,
-                    return_projected=True
+                # Encode with student using forward()
+                _, student_docs = student_model(
+                    doc_inputs['input_ids'],
+                    doc_inputs['attention_mask'],
+                    normalize=True
                 )
                 student_doc_embs.append(student_docs)
 

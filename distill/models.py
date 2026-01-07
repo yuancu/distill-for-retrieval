@@ -30,11 +30,24 @@ class ProjectionLayer(nn.Module):
 
 
 class StudentModelWithProjection(nn.Module):
-    """Student model with projection layer for distillation"""
-    def __init__(self, student_model_name, projection_layer):
+    """Student model with optional projection layer for distillation
+
+    Two modes:
+    1. With projection: Student (768d) -> Projection -> Teacher dimension (3584d)
+    2. Without projection (MRL): Student (768d) -> Teacher's first 768d (MRL-based)
+    """
+    def __init__(self, student_model_name, projection_layer=None, use_projection=True):
         super().__init__()
         self.student = SentenceTransformer(student_model_name)
         self.projection = projection_layer
+        self.use_projection = use_projection
+
+        # Store student dimension
+        test_emb = self.student.encode(["test"], convert_to_tensor=True)
+        self.student_dim = test_emb.shape[-1]
+
+        if use_projection and projection_layer is None:
+            raise ValueError("projection_layer must be provided when use_projection=True")
 
     def encode(self, texts, normalize=True, return_projected=True):
         """Encode texts to embeddings
@@ -42,19 +55,21 @@ class StudentModelWithProjection(nn.Module):
         Args:
             texts: List of strings
             normalize: Whether to L2-normalize embeddings
-            return_projected: If True, return 3584d; if False, return 768d
+            return_projected: If True and use_projection=True, return projected dim;
+                            otherwise return base student embeddings
         """
-        # Get student embeddings (768d)
+        # Get student embeddings (e.g., 768d)
         student_emb = self.student.encode(
             texts,
             convert_to_tensor=True,
             normalize_embeddings=normalize
         )
 
-        if not return_projected:
+        # If not using projection or not returning projected, return base embeddings
+        if not self.use_projection or not return_projected:
             return student_emb
 
-        # Project to teacher dimension (3584d)
+        # Project to teacher dimension (e.g., 3584d)
         projected_emb = self.projection(student_emb)
 
         if normalize:
@@ -63,7 +78,12 @@ class StudentModelWithProjection(nn.Module):
         return projected_emb
 
     def forward(self, input_ids, attention_mask, normalize=True):
-        """Forward pass for training"""
+        """Forward pass for training
+
+        Returns:
+            student_emb: Base student embeddings (e.g., 768d)
+            output_emb: Either projected embeddings (if use_projection) or student_emb
+        """
         # Get student embeddings from base model
         output = self.student[0].auto_model(
             input_ids=input_ids,
@@ -81,6 +101,10 @@ class StudentModelWithProjection(nn.Module):
         if normalize:
             student_emb = F.normalize(student_emb, p=2, dim=-1)
 
+        # If not using projection, return student embeddings for both
+        if not self.use_projection:
+            return student_emb, student_emb
+
         # Project to teacher dimension
         projected_emb = self.projection(student_emb)
 
@@ -89,3 +113,14 @@ class StudentModelWithProjection(nn.Module):
             projected_emb = F.normalize(projected_emb, p=2, dim=-1)
 
         return student_emb, projected_emb
+
+    def get_output_dim(self):
+        """Get the output dimension for distillation
+
+        Returns:
+            int: Output dimension (student_dim if not using projection, else projected dim)
+        """
+        if not self.use_projection:
+            return self.student_dim
+        # Get projection output dimension
+        return self.projection.layer2.out_features
