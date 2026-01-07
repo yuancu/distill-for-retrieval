@@ -15,6 +15,7 @@ from .distributed import (
     get_ddp_model,
     save_checkpoint,
 )
+from .config import TrainingConfig, load_config, list_available_configs
 
 __all__ = [
     'ProjectionLayer',
@@ -35,4 +36,7 @@ __all__ = [
     'wrap_model_ddp',
     'get_ddp_model',
     'save_checkpoint',
+    'TrainingConfig',
+    'load_config',
+    'list_available_configs',
 ]

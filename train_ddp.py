@@ -1,21 +1,25 @@
 #!/usr/bin/env python
-"""Distributed training launcher for multi-GPU training.
+"""Config-based distributed training launcher for multi-GPU training.
 
 Usage:
-    # Single GPU
+    # Single GPU with default config
     python train_ddp.py
 
-    # Multi-GPU (8 GPUs)
+    # Multi-GPU (8 GPUs) with default config
     torchrun --nproc_per_node=8 train_ddp.py
 
     # Multi-GPU with custom config
-    torchrun --nproc_per_node=8 train_ddp.py --use_projection=False
+    torchrun --nproc_per_node=8 train_ddp.py --config configs/mrl.yaml
+
+    # List available configs
+    python train_ddp.py --list-configs
 """
 
 import os
 import argparse
 import torch
 import logging
+from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
 from distill import (
@@ -28,6 +32,9 @@ from distill import (
     wrap_model_ddp,
     get_rank,
     is_main_process,
+    TrainingConfig,
+    load_config,
+    list_available_configs,
 )
 from distill.save_model import save_distilled_model_to_artifacts
 
@@ -46,55 +53,51 @@ class RankFilter(logging.Filter):
         return True
 
 
+# Add the rank filter to all handlers of the root logger
+# This ensures all loggers (including third-party ones) have rank information
+rank_filter = RankFilter()
+for handler in logging.root.handlers:
+    handler.addFilter(rank_filter)
+
 logger = logging.getLogger(__name__)
-logger.addFilter(RankFilter())
 
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Distributed training for model distillation')
+    parser = argparse.ArgumentParser(
+        description='Config-based distributed training for model distillation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single GPU with default config
+  python train_ddp.py
 
-    # Model configuration
-    parser.add_argument('--teacher_model', type=str, default='infly/inf-retriever-v1-pro',
-                        help='Teacher model name')
-    parser.add_argument('--student_model', type=str, default='sentence-transformers/all-mpnet-base-v2',
-                        help='Student model name')
-    parser.add_argument('--use_projection', type=bool, default=True,
-                        help='Use projection layer (True) or MRL-based distillation (False)')
+  # 8 GPUs with custom config
+  torchrun --nproc_per_node=8 train_ddp.py --config configs/mrl.yaml
 
-    # Training configuration
-    parser.add_argument('--phase1_epochs', type=int, default=1,
-                        help='Number of epochs for Phase 1')
-    parser.add_argument('--phase2_epochs', type=int, default=3,
-                        help='Number of epochs for Phase 2')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size per GPU')
-    parser.add_argument('--phase1_lr', type=float, default=2e-5,
-                        help='Learning rate for Phase 1')
-    parser.add_argument('--phase2_lr', type=float, default=5e-6,
-                        help='Learning rate for Phase 2')
+  # List available configs
+  python train_ddp.py --list-configs
 
-    # Output paths
-    parser.add_argument('--output_dir', type=str, default='./checkpoints',
-                        help='Output directory for checkpoints')
+Config file structure:
+  configs/
+    default.yaml  - Default projection-based distillation
+    mrl.yaml      - MRL-based distillation (no projection)
+    quick_test.yaml - Quick test with minimal data
+        """
+    )
 
-    # Dataset configuration
-    parser.add_argument('--max_samples_phase1', type=int, default=100000,
-                        help='Max samples per dataset for Phase 1')
-    parser.add_argument('--max_samples_phase2', type=int, default=500000,
-                        help='Max samples for Phase 2')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default='configs/default.yaml',
+        help='Path to YAML config file (default: configs/default.yaml)'
+    )
 
-    # Skip phases
-    parser.add_argument('--skip_phase1', action='store_true',
-                        help='Skip Phase 1 training')
-    parser.add_argument('--skip_phase2', action='store_true',
-                        help='Skip Phase 2 training')
-
-    # Model saving
-    parser.add_argument('--save_to_artifacts', action='store_true',
-                        help='Save final model to artifacts directory after training')
-    parser.add_argument('--artifacts_dir', type=str, default='./artifacts',
-                        help='Directory to save final model artifacts')
+    parser.add_argument(
+        '--list-configs',
+        action='store_true',
+        help='List available config files and exit'
+    )
 
     return parser.parse_args()
 
@@ -103,6 +106,36 @@ def main():
     """Main training function."""
     args = parse_args()
 
+    # List configs if requested
+    if args.list_configs:
+        print("Available configuration files:")
+        print("=" * 80)
+        configs = list_available_configs()
+        if not configs:
+            print("No config files found in configs/")
+        else:
+            for config_path in configs:
+                print(f"  - {config_path}")
+                # Try to load and show brief description
+                try:
+                    cfg = TrainingConfig(str(config_path))
+                    mode = "WITH PROJECTION" if cfg.model['use_projection'] else "MRL-BASED"
+                    print(f"      Mode: {mode}")
+                    print(f"      Phase 1 epochs: {cfg.phase1['num_epochs']}")
+                    print(f"      Phase 2 epochs: {cfg.phase2['num_epochs']}")
+                    print()
+                except Exception as e:
+                    print(f"      Error loading: {e}\n")
+        return
+
+    # Load configuration
+    try:
+        config = TrainingConfig(args.config)
+    except Exception as e:
+        logger.error(f"Failed to load config from {args.config}: {e}")
+        logger.info("Use --list-configs to see available configs")
+        return
+
     # Setup distributed training
     rank, local_rank, world_size, device = setup_distributed()
 
@@ -110,24 +143,31 @@ def main():
         logger.info("=" * 80)
         logger.info("Distributed Training Configuration")
         logger.info("=" * 80)
+        logger.info(f"Config file: {args.config}")
+        logger.info(f"Config name: {config.config_name}")
+        logger.info(f"Experiment name: {config.get_experiment_name()}")
         logger.info(f"World size: {world_size}")
-        logger.info(f"Teacher model: {args.teacher_model}")
-        logger.info(f"Student model: {args.student_model}")
-        logger.info(f"Distillation mode: {'WITH PROJECTION' if args.use_projection else 'MRL-BASED'}")
-        logger.info(f"Batch size per GPU: {args.batch_size}")
-        logger.info(f"Effective batch size: {args.batch_size * world_size}")
+        logger.info(f"Teacher model: {config.model['teacher']}")
+        logger.info(f"Student model: {config.model['student']}")
+        mode_str = "WITH PROJECTION" if config.model['use_projection'] else "MRL-BASED"
+        logger.info(f"Distillation mode: {mode_str}")
         logger.info("=" * 80)
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
-    phase1_checkpoint = os.path.join(args.output_dir, "phase1_best")
-    phase2_checkpoint = os.path.join(args.output_dir, "phase2_best")
+    # Create output directories and save config
+    checkpoint_dir = config.get_checkpoint_dir()
+    if is_main_process(rank):
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        config.save_config_copy(checkpoint_dir)
+        logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
+
+    phase1_checkpoint = checkpoint_dir / "phase1_best"
+    phase2_checkpoint = checkpoint_dir / "phase2_best"
 
     # Load teacher model (frozen, not wrapped with DDP)
     if is_main_process(rank):
-        logger.info(f"Loading teacher model: {args.teacher_model}")
+        logger.info(f"\nLoading teacher model: {config.model['teacher']}")
 
-    teacher_model = SentenceTransformer(args.teacher_model)
+    teacher_model = SentenceTransformer(config.model['teacher'])
     teacher_model.eval()
     for param in teacher_model.parameters():
         param.requires_grad = False
@@ -135,18 +175,22 @@ def main():
 
     # Create student model
     if is_main_process(rank):
-        logger.info(f"Loading student model: {args.student_model}")
+        logger.info(f"Loading student model: {config.model['student']}")
 
-    if args.use_projection:
-        projection_layer = ProjectionLayer(768, 1536, 3584)
+    if config.model['use_projection']:
+        projection_layer = ProjectionLayer(
+            config.model['student_dim'],
+            config.model['projection_hidden_dim'],
+            config.model['teacher_dim']
+        )
         student_model = StudentModelWithProjection(
-            args.student_model,
+            config.model['student'],
             projection_layer=projection_layer,
             use_projection=True
         )
     else:
         student_model = StudentModelWithProjection(
-            args.student_model,
+            config.model['student'],
             projection_layer=None,
             use_projection=False
         )
@@ -157,45 +201,19 @@ def main():
     if is_main_process(rank):
         logger.info("Models loaded and wrapped with DDP")
 
-    # Phase 1 configuration
-    phase1_config = {
-        'batch_size': args.batch_size,
-        'learning_rate': args.phase1_lr,
-        'warmup_steps': 1000,
-        'num_epochs': args.phase1_epochs,
-        'mse_weight': 0.4,
-        'cosine_weight': 0.6,
-        'max_length': 512,
-        'gradient_accumulation_steps': 4,
-        'max_samples_per_dataset': args.max_samples_phase1
-    }
-
-    # Phase 2 configuration
-    phase2_config = {
-        'batch_size': args.batch_size,
-        'learning_rate': args.phase2_lr,
-        'warmup_steps': 500,
-        'num_epochs': args.phase2_epochs,
-        'infonce_weight': 0.8,
-        'mse_weight': 0.2,
-        'temperature': 0.02,
-        'max_length': 512,
-        'num_negatives': 7,
-        'gradient_accumulation_steps': 8,
-        'max_samples': args.max_samples_phase2
-    }
-
     # Phase 1: General Distillation
-    if not args.skip_phase1:
+    if not config.training['skip_phase1']:
         if is_main_process(rank):
-            logger.info("\nStarting Phase 1 training...")
+            logger.info("\n" + "=" * 80)
+            logger.info("Starting Phase 1 training...")
+            logger.info("=" * 80)
 
         student_model = train_phase1(
             student_model,
             teacher_model,
-            phase1_config,
+            config.phase1,
             device,
-            phase1_checkpoint,
+            str(phase1_checkpoint),
             rank=rank
         )
 
@@ -203,19 +221,21 @@ def main():
             logger.info(f"Phase 1 complete. Checkpoint saved to: {phase1_checkpoint}.pt")
     else:
         if is_main_process(rank):
-            logger.info("Skipping Phase 1 (--skip_phase1 flag set)")
+            logger.info("Skipping Phase 1 (skip_phase1=true in config)")
 
     # Phase 2: Task-Specific Training
-    if not args.skip_phase2:
+    if not config.training['skip_phase2']:
         if is_main_process(rank):
-            logger.info("\nStarting Phase 2 training...")
+            logger.info("\n" + "=" * 80)
+            logger.info("Starting Phase 2 training...")
+            logger.info("=" * 80)
 
         student_model = train_phase2(
             student_model,
             teacher_model,
-            phase2_config,
+            config.phase2,
             device,
-            phase2_checkpoint,
+            str(phase2_checkpoint),
             rank=rank
         )
 
@@ -223,19 +243,19 @@ def main():
             logger.info(f"Phase 2 complete. Checkpoint saved to: {phase2_checkpoint}.pt")
     else:
         if is_main_process(rank):
-            logger.info("Skipping Phase 2 (--skip_phase2 flag set)")
+            logger.info("Skipping Phase 2 (skip_phase2=true in config)")
 
     # Save to artifacts (only on rank 0)
-    if args.save_to_artifacts and is_main_process(rank):
+    if config.training['save_to_artifacts'] and is_main_process(rank):
         logger.info("\n" + "=" * 80)
         logger.info("Saving model to artifacts...")
         logger.info("=" * 80)
 
         # Determine which checkpoint to save (Phase 2 if available, else Phase 1)
-        if not args.skip_phase2:
+        if not config.training['skip_phase2']:
             final_checkpoint = f"{phase2_checkpoint}.pt"
             logger.info(f"Using Phase 2 checkpoint: {final_checkpoint}")
-        elif not args.skip_phase1:
+        elif not config.training['skip_phase1']:
             final_checkpoint = f"{phase1_checkpoint}.pt"
             logger.info(f"Using Phase 1 checkpoint: {final_checkpoint}")
         else:
@@ -243,14 +263,25 @@ def main():
             final_checkpoint = None
 
         if final_checkpoint and os.path.exists(final_checkpoint):
+            # Get artifacts directory
+            artifacts_dir = config.get_artifacts_dir()
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save config copy to artifacts
+            config.save_config_copy(artifacts_dir)
+
             try:
+                # Model name will be auto-generated based on config
+                model_name = config.get_experiment_name()
+
                 output_path = save_distilled_model_to_artifacts(
-                    student_model=student_model,  # Will be automatically unwrapped
+                    student_model=student_model,
                     checkpoint_path=final_checkpoint,
-                    artifacts_dir=args.artifacts_dir,
-                    model_name=None  # Auto-generate based on mode
+                    artifacts_dir=str(artifacts_dir.parent),  # Parent dir, function creates subdirectory
+                    model_name=model_name
                 )
                 logger.info(f"\n✓ Model saved to: {output_path}")
+                logger.info(f"✓ Config saved to: {artifacts_dir / f'config_{config.config_name}.yaml'}")
             except Exception as e:
                 logger.error(f"Failed to save model: {e}")
         elif final_checkpoint:
@@ -262,6 +293,11 @@ def main():
     if is_main_process(rank):
         logger.info("\n" + "=" * 80)
         logger.info("Training completed successfully!")
+        logger.info("=" * 80)
+        logger.info(f"Experiment: {config.get_experiment_name()}")
+        logger.info(f"Checkpoints: {checkpoint_dir}")
+        if config.training['save_to_artifacts']:
+            logger.info(f"Artifacts: {config.get_artifacts_dir()}")
         logger.info("=" * 80)
 
 

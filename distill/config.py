@@ -1,0 +1,148 @@
+"""Configuration management for distillation training."""
+
+import os
+import yaml
+import shutil
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+
+class TrainingConfig:
+    """Training configuration loaded from YAML file."""
+
+    def __init__(self, config_path: str):
+        """Load configuration from YAML file.
+
+        Args:
+            config_path: Path to YAML config file
+        """
+        self.config_path = Path(config_path)
+        self.config_name = self.config_path.stem  # Filename without extension
+
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        with open(self.config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+
+        # Validate required sections
+        required_sections = ['model', 'phase1', 'phase2', 'training', 'paths']
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required section '{section}' in config")
+
+    @property
+    def model(self) -> Dict[str, Any]:
+        """Get model configuration."""
+        return self.config['model']
+
+    @property
+    def phase1(self) -> Dict[str, Any]:
+        """Get Phase 1 training configuration."""
+        return self.config['phase1']
+
+    @property
+    def phase2(self) -> Dict[str, Any]:
+        """Get Phase 2 training configuration."""
+        return self.config['phase2']
+
+    @property
+    def training(self) -> Dict[str, Any]:
+        """Get training control settings."""
+        return self.config['training']
+
+    @property
+    def paths(self) -> Dict[str, Any]:
+        """Get output paths configuration."""
+        return self.config['paths']
+
+    def get_model_name(self) -> str:
+        """Get model name based on configuration.
+
+        Returns:
+            Model name like 'distilled-mpnet-3584d' or 'distilled-mpnet-768d-mrl'
+        """
+        use_projection = self.model['use_projection']
+        if use_projection:
+            output_dim = self.model['teacher_dim']
+            return f"distilled-mpnet-{output_dim}d"
+        else:
+            output_dim = self.model['student_dim']
+            return f"distilled-mpnet-{output_dim}d-mrl"
+
+    def get_experiment_name(self) -> str:
+        """Get experiment name combining model name and config name.
+
+        Returns:
+            Experiment name like 'distilled-mpnet-3584d-default'
+        """
+        return f"{self.get_model_name()}-{self.config_name}"
+
+    def get_checkpoint_dir(self) -> Path:
+        """Get directory for saving checkpoints.
+
+        Returns:
+            Path to checkpoint directory
+        """
+        output_dir = Path(self.paths['output_dir'])
+        return output_dir / self.get_experiment_name()
+
+    def get_artifacts_dir(self) -> Path:
+        """Get directory for saving artifacts.
+
+        Returns:
+            Path to artifacts directory
+        """
+        artifacts_dir = Path(self.paths['artifacts_dir'])
+        return artifacts_dir / self.get_experiment_name()
+
+    def save_config_copy(self, dest_dir: Path):
+        """Save a copy of the config file to destination directory.
+
+        Args:
+            dest_dir: Destination directory
+        """
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / f"config_{self.config_name}.yaml"
+        shutil.copy2(self.config_path, dest_file)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Get full configuration as dictionary.
+
+        Returns:
+            Complete configuration dictionary
+        """
+        return self.config.copy()
+
+    def __repr__(self) -> str:
+        """String representation."""
+        return f"TrainingConfig(config_name='{self.config_name}', experiment='{self.get_experiment_name()}')"
+
+
+def load_config(config_path: Optional[str] = None) -> TrainingConfig:
+    """Load training configuration from YAML file.
+
+    Args:
+        config_path: Path to config file. If None, uses default config.
+
+    Returns:
+        TrainingConfig object
+    """
+    if config_path is None:
+        # Use default config
+        config_path = Path(__file__).parent.parent / "configs" / "default.yaml"
+
+    return TrainingConfig(config_path)
+
+
+def list_available_configs() -> list:
+    """List all available config files.
+
+    Returns:
+        List of config file paths
+    """
+    configs_dir = Path(__file__).parent.parent / "configs"
+    if not configs_dir.exists():
+        return []
+
+    return sorted(configs_dir.glob("*.yaml"))

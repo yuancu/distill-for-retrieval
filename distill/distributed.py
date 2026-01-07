@@ -116,7 +116,7 @@ def wrap_model_ddp(model, device, local_rank):
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False  # Set to True if you have unused parameters
+            find_unused_parameters=True  # Set to True if you have unused parameters
         )
 
     return model

@@ -21,7 +21,8 @@ class Phase1Dataset(Dataset):
         # Load MS MARCO passages
         try:
             logger.info("Loading MS MARCO...")
-            msmarco = load_dataset('ms_marco', 'v1.1', split='train')
+            # Use streaming mode to avoid feature type compatibility issues
+            msmarco = load_dataset('ms_marco', 'v1.1', split='train', streaming=True)
             for i, item in enumerate(msmarco):
                 if i >= max_samples_per_dataset:
                     break
@@ -53,46 +54,49 @@ class Phase2Dataset(Dataset):
 
         logger.info(f"Loading MS MARCO for Phase 2 ({split} split)...")
 
-        # Load MS MARCO with passages
-        dataset = load_dataset('ms_marco', 'v1.1', split=split)
+        try:
+            # Use streaming mode to avoid feature type compatibility issues
+            dataset = load_dataset('ms_marco', 'v1.1', split=split, streaming=True)
 
-        for i, item in enumerate(tqdm(dataset, desc="Processing samples")):
-            if i >= max_samples:
-                break
-
-            query = item['query']
-            passages = item['passages']
-
-            # Find positive passage
-            positive_idx = None
-            for idx, is_selected in enumerate(passages['is_selected']):
-                if is_selected:
-                    positive_idx = idx
+            for i, item in enumerate(tqdm(dataset, desc="Processing samples", total=max_samples)):
+                if i >= max_samples:
                     break
 
-            if positive_idx is None:
-                continue
+                query = item['query']
+                passages = item['passages']
 
-            positive_passage = passages['passage_text'][positive_idx]
+                # Find positive passage
+                positive_idx = None
+                for idx, is_selected in enumerate(passages['is_selected']):
+                    if is_selected:
+                        positive_idx = idx
+                        break
 
-            # Collect negative passages (non-selected ones)
-            negative_passages = [
-                passages['passage_text'][idx]
-                for idx, is_selected in enumerate(passages['is_selected'])
-                if not is_selected
-            ]
+                if positive_idx is None:
+                    continue
 
-            # Take up to 7 negatives
-            negative_passages = negative_passages[:7]
+                positive_passage = passages['passage_text'][positive_idx]
 
-            if len(negative_passages) > 0:
-                self.samples.append({
-                    'query': query,
-                    'positive': positive_passage,
-                    'negatives': negative_passages
-                })
+                # Collect negative passages (non-selected ones)
+                negative_passages = [
+                    passages['passage_text'][idx]
+                    for idx, is_selected in enumerate(passages['is_selected'])
+                    if not is_selected
+                ]
 
-        logger.info(f"Loaded {len(self.samples)} Phase 2 samples with negatives")
+                # Take up to 7 negatives
+                negative_passages = negative_passages[:7]
+
+                if len(negative_passages) > 0:
+                    self.samples.append({
+                        'query': query,
+                        'positive': positive_passage,
+                        'negatives': negative_passages
+                    })
+
+            logger.info(f"Loaded {len(self.samples)} Phase 2 samples with negatives")
+        except Exception as e:
+            logger.warning(f"Could not load MS MARCO for Phase 2: {e}")
 
     def __len__(self):
         return len(self.samples)
