@@ -1,0 +1,9 @@
+cache
+datasets
+artifacts
+.claude
+__pycache__
+MEMORY_OPTIMIZATION_SUMMARY.md
+archive
+checkpoints
+.vscode
