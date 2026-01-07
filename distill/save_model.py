@@ -7,8 +7,8 @@ import torch.nn as nn
 from sentence_transformers import SentenceTransformer, models
 from typing import Dict, Union, Any, Optional
 
-# Import the projection layer from distill module
-from distill import ProjectionLayer, StudentModelWithProjection
+# Import the projection layer and DDP utilities from distill module
+from distill import ProjectionLayer, StudentModelWithProjection, get_ddp_model
 
 
 class ProjectionModule(nn.Module):
@@ -218,19 +218,26 @@ def save_distilled_model_to_artifacts(
     - Without projection (MRL): Saves base student model only (e.g., 768d)
 
     Args:
-        student_model: The trained StudentModelWithProjection
+        student_model: The trained StudentModelWithProjection (can be DDP-wrapped)
         checkpoint_path: Path to the checkpoint (.pt file) to load weights from
         artifacts_dir: Directory to save the model (default: ./artifacts)
         model_name: Name for the saved model directory (auto-generated if None)
+
+    Note:
+        - In DDP training, call this function only on rank 0
+        - If model is DDP-wrapped, it will be automatically unwrapped
     """
 
     print("=" * 80)
     print("Saving Distilled Model to Artifacts")
     print("=" * 80)
 
+    # Unwrap DDP model if needed
+    student_model = get_ddp_model(student_model)
+
     # Load the best checkpoint
     print(f"\n1. Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
     student_model.load_state_dict(checkpoint['model_state_dict'])
     student_model.eval()
     print("   ✓ Checkpoint loaded successfully")

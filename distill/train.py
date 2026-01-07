@@ -4,45 +4,88 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 import logging
 
 from .datasets import Phase1Dataset, Phase2Dataset, phase2_collate_fn
 from .losses import Phase1Loss, Phase2Loss
+from .distributed import (
+    is_main_process,
+    get_world_size,
+    save_checkpoint as save_checkpoint_dist,
+    get_ddp_model,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
+def train_phase1(student_model, teacher_model, config, device, checkpoint_path, rank=0):
     """Phase 1: General distillation with MSE + Cosine loss
 
     Supports two modes:
     - With projection: Student (768d) -> Projection -> Teacher (3584d)
     - Without projection (MRL): Student (768d) -> Teacher's first 768d
+
+    Args:
+        student_model: Student model (possibly wrapped with DDP)
+        teacher_model: Teacher model (frozen)
+        config: Training configuration
+        device: Device to use
+        checkpoint_path: Path to save checkpoints
+        rank: Process rank for distributed training (default: 0)
     """
-    logger.info("=" * 80)
-    logger.info("Starting Phase 1: General Distillation")
-    logger.info("=" * 80)
+    if is_main_process(rank):
+        logger.info("=" * 80)
+        logger.info("Starting Phase 1: General Distillation")
+        logger.info("=" * 80)
 
     # Get distillation target dimension
-    target_dim = student_model.get_output_dim()
-    use_projection = student_model.use_projection
-    logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
-    logger.info(f"Target dimension: {target_dim}")
+    # Extract underlying model if wrapped with DDP
+    unwrapped_model = get_ddp_model(student_model)
+    target_dim = unwrapped_model.get_output_dim()
+    use_projection = unwrapped_model.use_projection
+
+    if is_main_process(rank):
+        logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
+        logger.info(f"Target dimension: {target_dim}")
+        if get_world_size() > 1:
+            logger.info(f"Distributed training on {get_world_size()} GPUs")
 
     # Get tokenizer from student model
-    tokenizer = student_model.student.tokenizer
+    tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
     # Load dataset
     max_samples = config.get('max_samples_per_dataset', 100000)
     dataset = Phase1Dataset(max_samples_per_dataset=max_samples)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=4
-    )
+
+    # Use DistributedSampler for multi-GPU training
+    world_size = get_world_size()
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['batch_size'],
+            sampler=sampler,
+            num_workers=4,
+            pin_memory=True
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True
+        )
+
 
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -74,10 +117,21 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
     global_step = 0
 
     for epoch in range(config['num_epochs']):
-        logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+        # Set epoch for distributed sampler (ensures different shuffling each epoch)
+        if world_size > 1:
+            sampler.set_epoch(epoch)
+
+        if is_main_process(rank):
+            logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+
         epoch_losses = []
 
-        pbar = tqdm(dataloader, desc=f"Phase 1 Epoch {epoch + 1}")
+        # Only show progress bar on rank 0
+        if is_main_process(rank):
+            pbar = tqdm(dataloader, desc=f"Phase 1 Epoch {epoch + 1}")
+        else:
+            pbar = dataloader
+
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
@@ -155,63 +209,106 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path):
 
             epoch_losses.append(loss.item() * config['gradient_accumulation_steps'])
 
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss.item() * config['gradient_accumulation_steps']:.4f}",
-                'lr': f"{scheduler.get_last_lr()[0]:.2e}",
-                'cosine_sim': f"{query_metrics['avg_cosine_sim']:.4f}"
-            })
+            # Update progress bar (only on rank 0)
+            if is_main_process(rank):
+                pbar.set_postfix({
+                    'loss': f"{loss.item() * config['gradient_accumulation_steps']:.4f}",
+                    'lr': f"{scheduler.get_last_lr()[0]:.2e}",
+                    'cosine_sim': f"{query_metrics['avg_cosine_sim']:.4f}"
+                })
 
-        # Epoch summary
+        # Gather losses from all processes for accurate averaging
         avg_loss = np.mean(epoch_losses)
-        logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
 
-        # Save best model
+        if is_main_process(rank):
+            logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+
+        # Save best model (only on rank 0, with barrier synchronization)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
+            save_checkpoint_dist({
                 'epoch': epoch,
-                'model_state_dict': student_model.state_dict(),
+                'model_state_dict': get_ddp_model(student_model).state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, f"{checkpoint_path}.pt")
-            logger.info(f"Saved best Phase 1 model with loss: {best_loss:.4f}")
+            }, f"{checkpoint_path}.pt", rank)
 
-    logger.info("\nPhase 1 training completed!")
+            if is_main_process(rank):
+                logger.info(f"Saved best Phase 1 model with loss: {best_loss:.4f}")
+
+    if is_main_process(rank):
+        logger.info("\nPhase 1 training completed!")
+
     return student_model
 
 
-def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
+def train_phase2(student_model, teacher_model, config, device, checkpoint_path, rank=0):
     """Phase 2: Task-specific training with InfoNCE + MSE
 
     Supports two modes:
     - With projection: Student (768d) -> Projection -> Teacher (3584d)
     - Without projection (MRL): Student (768d) -> Teacher's first 768d
+
+    Args:
+        student_model: Student model (possibly wrapped with DDP)
+        teacher_model: Teacher model (frozen)
+        config: Training configuration
+        device: Device to use
+        checkpoint_path: Path to save checkpoints
+        rank: Process rank for distributed training (default: 0)
     """
-    logger.info("\n" + "=" * 80)
-    logger.info("Starting Phase 2: Task-Specific Training")
-    logger.info("=" * 80)
+    if is_main_process(rank):
+        logger.info("\n" + "=" * 80)
+        logger.info("Starting Phase 2: Task-Specific Training")
+        logger.info("=" * 80)
 
     # Get distillation target dimension
-    target_dim = student_model.get_output_dim()
-    use_projection = student_model.use_projection
-    logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
-    logger.info(f"Target dimension: {target_dim}")
+    # Extract underlying model if wrapped with DDP
+    unwrapped_model = get_ddp_model(student_model)
+    target_dim = unwrapped_model.get_output_dim()
+    use_projection = unwrapped_model.use_projection
+
+    if is_main_process(rank):
+        logger.info(f"Distillation mode: {'With projection' if use_projection else 'MRL-based (no projection)'}")
+        logger.info(f"Target dimension: {target_dim}")
+        if get_world_size() > 1:
+            logger.info(f"Distributed training on {get_world_size()} GPUs")
 
     # Get tokenizer from student model
-    tokenizer = student_model.student.tokenizer
+    tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
     # Load dataset
     max_samples = config.get('max_samples', 500000)
     dataset = Phase2Dataset(split='train', max_samples=max_samples)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=4,
-        collate_fn=phase2_collate_fn  # Use custom collate function
-    )
+
+    # Use DistributedSampler for multi-GPU training
+    world_size = get_world_size()
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['batch_size'],
+            sampler=sampler,
+            num_workers=4,
+            collate_fn=phase2_collate_fn,
+            pin_memory=True
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            num_workers=4,
+            collate_fn=phase2_collate_fn,
+            pin_memory=True
+        )
 
     # Setup optimizer with lower learning rate
     optimizer = torch.optim.AdamW(
@@ -244,10 +341,21 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
     global_step = 0
 
     for epoch in range(config['num_epochs']):
-        logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+        # Set epoch for distributed sampler (ensures different shuffling each epoch)
+        if world_size > 1:
+            sampler.set_epoch(epoch)
+
+        if is_main_process(rank):
+            logger.info(f"\nEpoch {epoch + 1}/{config['num_epochs']}")
+
         epoch_losses = []
 
-        pbar = tqdm(dataloader, desc=f"Phase 2 Epoch {epoch + 1}")
+        # Only show progress bar on rank 0
+        if is_main_process(rank):
+            pbar = tqdm(dataloader, desc=f"Phase 2 Epoch {epoch + 1}")
+        else:
+            pbar = dataloader
+
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
@@ -355,27 +463,35 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path):
 
             epoch_losses.append(loss.item() * config['gradient_accumulation_steps'])
 
-            pbar.set_postfix({
-                'loss': f"{loss.item() * config['gradient_accumulation_steps']:.4f}",
-                'infonce': f"{metrics['infonce_loss']:.4f}",
-                'mse': f"{metrics['mse_loss']:.6f}",
-                'lr': f"{scheduler.get_last_lr()[0]:.2e}"
-            })
+            # Update progress bar (only on rank 0)
+            if is_main_process(rank):
+                pbar.set_postfix({
+                    'loss': f"{loss.item() * config['gradient_accumulation_steps']:.4f}",
+                    'infonce': f"{metrics['infonce_loss']:.4f}",
+                    'mse': f"{metrics['mse_loss']:.6f}",
+                    'lr': f"{scheduler.get_last_lr()[0]:.2e}"
+                })
 
-        # Epoch summary
+        # Gather losses from all processes for accurate averaging
         avg_loss = np.mean(epoch_losses)
-        logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
 
-        # Save best model
+        if is_main_process(rank):
+            logger.info(f"Epoch {epoch + 1} average loss: {avg_loss:.4f}")
+
+        # Save best model (only on rank 0, with barrier synchronization)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
+            save_checkpoint_dist({
                 'epoch': epoch,
-                'model_state_dict': student_model.state_dict(),
+                'model_state_dict': get_ddp_model(student_model).state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, f"{checkpoint_path}.pt")
-            logger.info(f"Saved best Phase 2 model with loss: {best_loss:.4f}")
+            }, f"{checkpoint_path}.pt", rank)
 
-    logger.info("\nPhase 2 training completed!")
+            if is_main_process(rank):
+                logger.info(f"Saved best Phase 2 model with loss: {best_loss:.4f}")
+
+    if is_main_process(rank):
+        logger.info("\nPhase 2 training completed!")
+
     return student_model

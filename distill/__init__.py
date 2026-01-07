@@ -5,6 +5,16 @@ from .losses import Phase1Loss, Phase2Loss
 from .datasets import Phase1Dataset, Phase2Dataset, phase2_collate_fn
 from .train import train_phase1, train_phase2
 from .evaluate import evaluate_retrieval
+from .distributed import (
+    setup_distributed,
+    cleanup_distributed,
+    is_main_process,
+    get_rank,
+    get_world_size,
+    wrap_model_ddp,
+    get_ddp_model,
+    save_checkpoint,
+)
 
 __all__ = [
     'ProjectionLayer',
@@ -17,4 +27,12 @@ __all__ = [
     'train_phase1',
     'train_phase2',
     'evaluate_retrieval',
+    'setup_distributed',
+    'cleanup_distributed',
+    'is_main_process',
+    'get_rank',
+    'get_world_size',
+    'wrap_model_ddp',
+    'get_ddp_model',
+    'save_checkpoint',
 ]
