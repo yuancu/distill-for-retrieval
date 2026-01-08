@@ -1,9 +1,12 @@
 # Quick test configuration for fast experimentation
 # Reduced epochs and samples for quick testing
 
+# Query instruction for retrieval
+query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+
 # Model configuration
 model:
-  teacher: "infly/inf-retriever-v1-pro"
+  teacher: "infly/inf-retriever-v1"
   student: "sentence-transformers/all-mpnet-base-v2"
   teacher_dim: 3584
   student_dim: 768
@@ -12,6 +15,11 @@ model:
 
 # Phase 1: Quick test with minimal data
 phase1:
+  # Pre-computed embeddings (required for faster training)
+  # Format: {base_dir}/{dataset_name}_{precision}/
+  # Example: ./cache/embedding/msmarco_fp16/
+  precomputed_embeddings_dir: "./cache/embedding/"
+
   # Dataset configuration - minimal samples for quick testing
   datasets:
     - name: "msmarco"
@@ -29,6 +37,11 @@ phase1:
 
 # Phase 2: Quick test
 phase2:
+  # Pre-computed embeddings (required for faster training)
+  # Format: {base_dir}/{dataset_name}_{precision}/
+  # Example: ./cache/embedding/msmarco_fp16/
+  precomputed_embeddings_dir: "./cache/embedding/"
+
   # Dataset configuration - minimal for quick testing
   datasets:
     - name: "msmarco"

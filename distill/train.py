@@ -244,7 +244,7 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             sampler=sampler,
-            num_workers=4,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
             pin_memory=True
         )
     else:
@@ -252,7 +252,7 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             shuffle=True,
-            num_workers=4,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
             pin_memory=True
         )
 
@@ -305,9 +305,10 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            # Batch contains tuples of (text, idx)
-            texts = [item[0] for item in batch]
-            indices = [item[1] for item in batch]
+            # DataLoader's default collate_fn batches tuples into tuple of batches
+            # So batch is (list_of_texts, tensor_of_indices), not list of tuples
+            texts, indices = batch
+            indices = indices.tolist()  # Convert tensor to list
 
             # Tokenize inputs
             text_inputs = tokenizer(
@@ -487,7 +488,7 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             sampler=sampler,
-            num_workers=4,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
             collate_fn=phase2_collate_fn,
             pin_memory=True
         )
@@ -496,7 +497,7 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             shuffle=True,
-            num_workers=4,
+            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
             collate_fn=phase2_collate_fn,
             pin_memory=True
         )

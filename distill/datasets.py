@@ -182,6 +182,11 @@ class Phase2DatasetPrecomputed(Dataset):
         """Build training samples from qrels."""
         self.samples = []
 
+        # Pre-compute valid corpus IDs (ones that exist in both corpus and embeddings)
+        # This avoids checking membership in corpus dict millions of times
+        valid_corpus_ids = [doc_id for doc_id in self.corpus_ids if doc_id in self.corpus]
+        logger.info(f"Pre-computed {len(valid_corpus_ids)} valid corpus IDs for negative sampling")
+
         for query_id, doc_scores in self.qrels.items():
             if query_id not in self.queries or query_id not in self.query_id_to_idx:
                 continue
@@ -203,20 +208,16 @@ class Phase2DatasetPrecomputed(Dataset):
             for neg_doc_id, _ in negative_docs:
                 if len(negative_doc_ids) >= self.num_negatives:
                     break
-                if neg_doc_id in self.corpus and neg_doc_id in self.corpus_id_to_idx:
+                if neg_doc_id in self.corpus_id_to_idx:
                     negative_doc_ids.append(neg_doc_id)
 
             # Sample random negatives if needed
             if len(negative_doc_ids) < self.num_negatives:
-                judged_doc_ids = set(doc_scores.keys())
-                available_corpus_ids = [
-                    doc_id for doc_id in self.corpus_ids
-                    if doc_id not in judged_doc_ids and doc_id in self.corpus
-                ]
+                # Use pre-computed valid_corpus_ids and filter only by judged_doc_ids
+                # This is much faster than checking corpus membership for each ID
                 num_needed = self.num_negatives - len(negative_doc_ids)
-                if len(available_corpus_ids) >= num_needed:
-                    sampled = random.sample(available_corpus_ids, num_needed)
-                    negative_doc_ids.extend(sampled)
+                sampled = random.sample(valid_corpus_ids, num_needed)
+                negative_doc_ids.extend(sampled)
 
             # Only add if we have at least one negative
             if negative_doc_ids:
