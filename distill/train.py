@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 def train_phase1(student_model, teacher_model, config, device, checkpoint_path, rank=0):
     """Phase 1: General distillation with MSE + Cosine loss
 
+    Trains on mixed queries (with instruction prefix) and documents (without prefix)
+    without discrimination. All texts are treated uniformly for pure distillation.
+
     Supports two modes:
     - With projection: Student (768d) -> Projection -> Teacher (3584d)
     - Without projection (MRL): Student (768d) -> Teacher's first 768d
@@ -56,9 +59,9 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
-    # Load dataset
-    max_samples = config.get('max_samples_per_dataset', 100000)
-    dataset = Phase1Dataset(max_samples_per_dataset=max_samples)
+    # Load dataset(s)
+    datasets_config = config.get('datasets')
+    dataset = Phase1Dataset(datasets_config=datasets_config)
 
     # Use DistributedSampler for multi-GPU training
     world_size = get_world_size()
@@ -135,20 +138,12 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            queries = batch['query']
-            passages = batch['passage']
+            # Batch is a list of strings (both queries and documents)
+            texts = batch
 
             # Tokenize inputs
-            query_inputs = tokenizer(
-                queries,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors='pt'
-            ).to(device)
-
-            passage_inputs = tokenizer(
-                passages,
+            text_inputs = tokenizer(
+                texts,
                 padding=True,
                 truncation=True,
                 max_length=max_length,
@@ -157,44 +152,29 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
 
             # Encode with teacher (frozen)
             with torch.no_grad():
-                teacher_query_emb = teacher_model.encode(
-                    queries,
+                teacher_emb = teacher_model.encode(
+                    texts,
                     convert_to_tensor=True,
-                    normalize_embeddings=True
-                ).to(device).clone()  # Clone to convert from inference mode tensor
-
-                teacher_passage_emb = teacher_model.encode(
-                    passages,
-                    convert_to_tensor=True,
-                    normalize_embeddings=True
+                    normalize_embeddings=True,
+                    show_progress_bar=False
                 ).to(device).clone()  # Clone to convert from inference mode tensor
 
                 # Slice teacher embeddings to target dimension if not using projection (MRL)
                 if not use_projection:
-                    teacher_query_emb = teacher_query_emb[:, :target_dim]
-                    teacher_passage_emb = teacher_passage_emb[:, :target_dim]
+                    teacher_emb = teacher_emb[:, :target_dim]
                     # Re-normalize after slicing
-                    teacher_query_emb = torch.nn.functional.normalize(teacher_query_emb, p=2, dim=-1)
-                    teacher_passage_emb = torch.nn.functional.normalize(teacher_passage_emb, p=2, dim=-1)
+                    teacher_emb = torch.nn.functional.normalize(teacher_emb, p=2, dim=-1)
 
             # Encode with student using forward() for proper gradient flow
-            _, student_query_emb = student_model(
-                query_inputs['input_ids'],
-                query_inputs['attention_mask'],
+            _, student_emb = student_model(
+                text_inputs['input_ids'],
+                text_inputs['attention_mask'],
                 normalize=True
             )
 
-            _, student_passage_emb = student_model(
-                passage_inputs['input_ids'],
-                passage_inputs['attention_mask'],
-                normalize=True
-            )
+            # Compute loss
+            loss, metrics = criterion(student_emb, teacher_emb)
 
-            # Compute loss for both queries and passages
-            query_loss, query_metrics = criterion(student_query_emb, teacher_query_emb)
-            passage_loss, passage_metrics = criterion(student_passage_emb, teacher_passage_emb)
-
-            loss = (query_loss + passage_loss) / 2
             loss = loss / config['gradient_accumulation_steps']
             loss.backward()
 
@@ -214,7 +194,7 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
                 pbar.set_postfix({
                     'loss': f"{loss.item() * config['gradient_accumulation_steps']:.4f}",
                     'lr': f"{scheduler.get_last_lr()[0]:.2e}",
-                    'cosine_sim': f"{query_metrics['avg_cosine_sim']:.4f}"
+                    'cosine_sim': f"{metrics['avg_cosine_sim']:.4f}"
                 })
 
         # Gather losses from all processes for accurate averaging
@@ -278,9 +258,16 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
-    # Load dataset
-    max_samples = config.get('max_samples', 500000)
-    dataset = Phase2Dataset(split='train', max_samples=max_samples)
+    # Load dataset(s)
+    datasets_config = config.get('datasets')
+    num_negatives = config.get('num_negatives', 7)
+
+
+    dataset = Phase2Dataset(
+        datasets_config=datasets_config,
+        split='train',
+        num_negatives=num_negatives
+    )
 
     # Use DistributedSampler for multi-GPU training
     world_size = get_world_size()
@@ -385,7 +372,8 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 teacher_query_emb = teacher_model.encode(
                     queries,
                     convert_to_tensor=True,
-                    normalize_embeddings=True
+                    normalize_embeddings=True,
+                    show_progress_bar=False
                 ).to(device).clone()  # Clone to convert from inference mode tensor
 
                 # Slice teacher embeddings to target dimension if not using projection (MRL)
@@ -420,7 +408,8 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                     teacher_docs = teacher_model.encode(
                         docs,
                         convert_to_tensor=True,
-                        normalize_embeddings=True
+                        normalize_embeddings=True,
+                        show_progress_bar=False
                     ).to(device).clone()  # Clone to convert from inference mode tensor
 
                     # Slice teacher embeddings to target dimension if not using projection (MRL)
@@ -442,6 +431,12 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             # Stack to (batch_size, num_docs, dim)
             teacher_doc_embs = torch.stack(teacher_doc_embs)
             student_doc_embs = torch.stack(student_doc_embs)
+
+            # Debug: Check shapes before passing to loss (only once per epoch)
+            if batch_idx == 0 and is_main_process(rank):
+                logger.info(f"[DEBUG] student_query_emb shape: {student_query_emb.shape}")
+                logger.info(f"[DEBUG] student_doc_embs shape: {student_doc_embs.shape}")
+                logger.info(f"[DEBUG] batch_size: {batch_size}, num_docs per query: {student_doc_embs.shape[1]}")
 
             # Compute loss
             loss, metrics = criterion(

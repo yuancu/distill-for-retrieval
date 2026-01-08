@@ -1,9 +1,10 @@
-cache
-datasets
-artifacts
 .claude
-__pycache__
-MEMORY_OPTIMIZATION_SUMMARY.md
-archive
-checkpoints
 .vscode
+__pycache__
+artifacts
+archive
+beir_datasets
+cache
+checkpoints
+datasets
+MEMORY_OPTIMIZATION_SUMMARY.md

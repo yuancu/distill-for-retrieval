@@ -70,9 +70,17 @@ model:
 # ============================================================================
 # Objective: Learn to mimic teacher's general embedding space
 # Loss: MSE + Cosine similarity
-# Data: MS MARCO + NQ + HotpotQA
+# Data: Configurable BEIR datasets (msmarco, nfcorpus, nq, hotpotqa, etc.)
 # ============================================================================
 phase1:
+  # Dataset configuration - can specify multiple datasets
+  datasets:
+    - name: "msmarco"               # Dataset name
+      max_samples: 100000           # Max samples from this dataset
+    - name: "nfcorpus"              # Add more datasets as needed
+      max_samples: 10000
+
+  # Training hyperparameters
   batch_size: 64                    # Batch size per GPU
   learning_rate: 2.0e-5             # Learning rate
   warmup_steps: 1000                # Warmup steps
@@ -81,16 +89,23 @@ phase1:
   cosine_weight: 0.6                # Cosine loss weight
   max_length: 512                   # Max sequence length
   gradient_accumulation_steps: 4    # Gradient accumulation
-  max_samples_per_dataset: 100000   # Max samples per dataset
 
 # ============================================================================
 # PHASE 2: TASK-SPECIFIC TRAINING
 # ============================================================================
 # Objective: Fine-tune for retrieval with contrastive learning
 # Loss: InfoNCE + MSE
-# Data: MS MARCO with hard negatives
+# Data: Configurable datasets with hard negatives (supports multiple datasets)
 # ============================================================================
 phase2:
+  # Dataset configuration - can specify multiple datasets
+  datasets:
+    - name: "msmarco"               # Dataset name
+      max_samples: 500000           # Max samples from this dataset
+    - name: "nfcorpus"              # Add more datasets as needed
+      max_samples: 50000
+
+  # Training hyperparameters
   batch_size: 64                    # Batch size per GPU
   learning_rate: 5.0e-6             # Lower LR for fine-tuning
   warmup_steps: 500                 # Warmup steps
@@ -101,7 +116,6 @@ phase2:
   max_length: 512                   # Max sequence length
   num_negatives: 7                  # Number of hard negatives
   gradient_accumulation_steps: 8    # Gradient accumulation
-  max_samples: 500000               # Total samples
 
 # ============================================================================
 # TRAINING CONTROL
@@ -121,6 +135,103 @@ paths:
   output_dir: "./checkpoints"   # Checkpoints saved here
   artifacts_dir: "./artifacts"  # Final models saved here
 ```
+
+## Available Datasets
+
+### Supported BEIR Datasets
+
+The training system uses the **beir library** to load datasets from the BEIR benchmark. Datasets are automatically downloaded and cached locally in `./beir_datasets/` for efficient reuse.
+
+**Requirements:**
+```bash
+pip install beir
+```
+
+**General Domain:**
+- `msmarco` - MS MARCO (large-scale web search)
+- `nq` - Natural Questions (Google search queries)
+- `hotpotqa` - HotpotQA (multi-hop reasoning)
+- `quora` - Quora duplicate questions
+
+**Scientific/Technical:**
+- `scidocs` - Scientific document retrieval
+- `scifact` - Scientific fact verification
+- `trec-covid` - COVID-19 research articles
+
+**Specialized:**
+- `nfcorpus` - Nutrition facts corpus
+- `fiqa` - Financial question answering
+- `arguana` - Argumentative QA
+- `dbpedia-entity` - DBpedia entity retrieval
+- `fever` - Fact extraction and verification
+- `climate-fever` - Climate change fact verification
+- `touche-2020` - Argument retrieval
+- `signal1m` - Signal-1M (large-scale news retrieval)
+
+**Dataset Loading:**
+- All datasets are loaded using the official `beir` library
+- Datasets are downloaded from the BEIR repository and cached locally
+- Supports corpus (documents), queries, and qrels (relevance judgments)
+- **Phase 1**: Randomly samples queries and documents separately with 1:19 ratio
+  - Queries get instruction prefix: `"Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "`
+  - Documents have no prefix (just title + text)
+  - No pairing required - purely for distillation
+  - All texts treated uniformly during training (no query/document discrimination)
+- **Phase 2**: Uses query-positive pairs with hard negatives from qrels
+  - Proper relevance pairs for contrastive learning
+  - Hard negatives extracted from qrels or randomly sampled
+
+### Using Multiple Datasets in Phase 1
+
+Phase 1 supports combining multiple datasets for better generalization:
+
+```yaml
+phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 100000
+    - name: "nfcorpus"
+      max_samples: 10000
+    - name: "hotpotqa"
+      max_samples: 50000
+```
+
+**Benefits of multiple datasets:**
+- Better generalization across domains
+- Improved zero-shot performance
+- More robust embeddings
+
+**Tips:**
+- Start with MS MARCO as the base (largest, most general)
+- Add domain-specific datasets based on your use case
+- Balance sample sizes to avoid dataset bias
+
+### Using Multiple Datasets in Phase 2
+
+Phase 2 also supports combining multiple datasets for task-specific fine-tuning:
+
+```yaml
+phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
+    - name: "nfcorpus"
+      max_samples: 50000
+    - name: "hotpotqa"
+      max_samples: 100000
+  num_negatives: 7
+```
+
+**Benefits of multiple datasets in Phase 2:**
+- Better generalization across domains and tasks
+- More diverse hard negatives for contrastive learning
+- Improved robustness to different query patterns
+
+**Choosing Phase 2 datasets:**
+- Use `msmarco` as base for general web search
+- Add domain-specific datasets for your target application
+- Balance sample sizes based on task importance
+- All datasets will use contrastive learning with hard negatives
 
 ## Hyperparameter Tuning Guide
 
@@ -158,27 +269,39 @@ phase2:
 ```yaml
 # Quick (1-2 hours on 8 GPUs)
 phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 10000
   num_epochs: 1
-  max_samples_per_dataset: 10000
 phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 10000
   num_epochs: 1
-  max_samples: 10000
 
 # Standard (4-5 hours on 8 GPUs)
 phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 100000
   num_epochs: 1
-  max_samples_per_dataset: 100000
 phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
   num_epochs: 3
-  max_samples: 500000
 
 # Thorough (10-12 hours on 8 GPUs)
 phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
   num_epochs: 3
-  max_samples_per_dataset: 500000
 phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 1000000
   num_epochs: 5
-  max_samples: 1000000
 ```
 
 ## Common Use Cases
@@ -187,35 +310,74 @@ phase2:
 ```yaml
 # File: configs/prototype.yaml
 phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 5000
   num_epochs: 1
-  max_samples_per_dataset: 5000
 
 phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 5000
   num_epochs: 1
-  max_samples: 5000
 
 training:
   save_to_artifacts: false
 ```
 
-### 2. Production Training
+### 2. Production Training with Multiple Datasets
 ```yaml
 # File: configs/production.yaml
 phase1:
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
+    - name: "nfcorpus"
+      max_samples: 50000
+    - name: "hotpotqa"
+      max_samples: 100000
   num_epochs: 2
-  max_samples_per_dataset: 500000
   learning_rate: 2.0e-5
 
 phase2:
+  datasets:
+    - name: "msmarco"
+      max_samples: 800000
+    - name: "nfcorpus"
+      max_samples: 100000
+    - name: "hotpotqa"
+      max_samples: 100000
   num_epochs: 5
-  max_samples: 1000000
   learning_rate: 5.0e-6
 
 training:
   save_to_artifacts: true
 ```
 
-### 3. Resume from Phase 1
+### 3. Domain-Specific Training
+```yaml
+# File: configs/scientific.yaml
+# Train on scientific/biomedical datasets
+phase1:
+  datasets:
+    - name: "scidocs"
+      max_samples: 50000
+    - name: "scifact"
+      max_samples: 10000
+    - name: "trec-covid"
+      max_samples: 20000
+  num_epochs: 2
+
+phase2:
+  datasets:
+    - name: "scifact"
+      max_samples: 30000
+    - name: "trec-covid"
+      max_samples: 20000
+  num_epochs: 3
+```
+
+### 4. Resume from Phase 1
 ```yaml
 # File: configs/phase2_only.yaml
 training:
@@ -226,7 +388,7 @@ training:
 # Make sure checkpoint exists in output_dir
 ```
 
-### 4. Ablation Study
+### 5. Ablation Study
 ```yaml
 # File: configs/ablation_high_lr.yaml
 phase1:

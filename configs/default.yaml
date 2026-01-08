@@ -18,8 +18,21 @@ model:
 
 # Phase 1: General Distillation
 # Loss: MSE (0.4) + Cosine (0.6)
-# Data: MS MARCO + NQ + HotpotQA
+# Data: Configurable BEIR datasets
 phase1:
+  # Dataset configuration
+  # Available BEIR datasets: msmarco, nfcorpus, trec-covid, nq, hotpotqa,
+  #                          fiqa, arguana, scidocs, scifact, etc.
+  datasets:
+    - name: "msmarco"
+      max_samples: 100000
+    # Uncomment to add more datasets:
+    # - name: "nfcorpus"
+    #   max_samples: 10000
+    # - name: "hotpotqa"
+    #   max_samples: 50000
+
+  # Training hyperparameters
   batch_size: 64
   learning_rate: 2.0e-5
   warmup_steps: 1000
@@ -28,12 +41,21 @@ phase1:
   cosine_weight: 0.6
   max_length: 512
   gradient_accumulation_steps: 4
-  max_samples_per_dataset: 100000
 
 # Phase 2: Task-Specific Training
 # Loss: InfoNCE (0.8) + MSE (0.2)
-# Data: MS MARCO with hard negatives
+# Data: Configurable datasets with hard negatives
 phase2:
+  # Dataset configuration - can specify multiple datasets
+  # Options: msmarco, nfcorpus, trec-covid, nq, hotpotqa, fiqa, etc.
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
+    # Uncomment to add more datasets:
+    # - name: "nfcorpus"
+    #   max_samples: 50000
+
+  # Training hyperparameters
   batch_size: 64
   learning_rate: 5.0e-6
   warmup_steps: 500
@@ -44,7 +66,6 @@ phase2:
   max_length: 512
   num_negatives: 7
   gradient_accumulation_steps: 8
-  max_samples: 500000
 
 # Training control
 training:

@@ -14,6 +14,14 @@ model:
 
 # Phase 1: General Distillation
 phase1:
+  # Dataset configuration
+  # Available BEIR datasets: msmarco, nfcorpus, trec-covid, nq, hotpotqa,
+  #                          fiqa, arguana, scidocs, scifact, etc.
+  datasets:
+    - name: "msmarco"
+      max_samples: 1000000
+
+  # Training hyperparameters
   batch_size: 64
   learning_rate: 2.0e-5
   warmup_steps: 1000
@@ -22,11 +30,16 @@ phase1:
   cosine_weight: 0.6
   max_length: 512
   gradient_accumulation_steps: 4
-  max_samples_per_dataset: 100000
 
 # Phase 2: Task-Specific Training
 phase2:
-  batch_size: 64
+  # Dataset configuration - can specify multiple datasets
+  datasets:
+    - name: "msmarco"
+      max_samples: 500000
+
+  # Training hyperparameters
+  batch_size: 16
   learning_rate: 5.0e-6
   warmup_steps: 500
   num_epochs: 3
@@ -36,7 +49,6 @@ phase2:
   max_length: 512
   num_negatives: 7
   gradient_accumulation_steps: 8
-  max_samples: 500000
 
 # Training control
 training:
