@@ -8,7 +8,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 import logging
 
-from .datasets import Phase1Dataset, Phase2Dataset, phase2_collate_fn
+from .datasets import Phase1DatasetPrecomputed, Phase2DatasetPrecomputed
 from .losses import Phase1Loss, Phase2Loss
 from .distributed import (
     is_main_process,
@@ -18,6 +18,122 @@ from .distributed import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MultiDatasetWrapper:
+    """Wrapper for multiple Phase1/Phase2 datasets that supports get_embedding methods."""
+
+    def __init__(self, datasets):
+        self.datasets = datasets
+        self.cumulative_sizes = [0]
+        for ds in datasets:
+            self.cumulative_sizes.append(self.cumulative_sizes[-1] + len(ds))
+
+    def __len__(self):
+        return self.cumulative_sizes[-1]
+
+    def __getitem__(self, idx):
+        # Find which dataset this index belongs to
+        dataset_idx = 0
+        for i, cum_size in enumerate(self.cumulative_sizes[1:]):
+            if idx < cum_size:
+                dataset_idx = i
+                break
+
+        # Get local index within that dataset
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
+        return self.datasets[dataset_idx][local_idx]
+
+    def get_embedding(self, idx):
+        """Get embedding from the appropriate dataset."""
+        # Find which dataset this index belongs to
+        dataset_idx = 0
+        for i, cum_size in enumerate(self.cumulative_sizes[1:]):
+            if idx < cum_size:
+                dataset_idx = i
+                break
+
+        # Get local index within that dataset
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
+        return self.datasets[dataset_idx].get_embedding(local_idx)
+
+    def get_query_embedding(self, idx):
+        """Get query embedding (for Phase 2)."""
+        dataset_idx = 0
+        for i, cum_size in enumerate(self.cumulative_sizes[1:]):
+            if idx < cum_size:
+                dataset_idx = i
+                break
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
+        return self.datasets[dataset_idx].get_query_embedding(local_idx)
+
+    def get_positive_embedding(self, idx):
+        """Get positive embedding (for Phase 2)."""
+        dataset_idx = 0
+        for i, cum_size in enumerate(self.cumulative_sizes[1:]):
+            if idx < cum_size:
+                dataset_idx = i
+                break
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
+        return self.datasets[dataset_idx].get_positive_embedding(local_idx)
+
+    def get_negative_embeddings(self, idx):
+        """Get negative embeddings (for Phase 2)."""
+        dataset_idx = 0
+        for i, cum_size in enumerate(self.cumulative_sizes[1:]):
+            if idx < cum_size:
+                dataset_idx = i
+                break
+        local_idx = idx - self.cumulative_sizes[dataset_idx]
+        return self.datasets[dataset_idx].get_negative_embeddings(local_idx)
+
+
+def phase2_collate_fn(batch):
+    """Custom collate function to handle variable-length negatives"""
+    queries = [item['query'] for item in batch]
+    positives = [item['positive'] for item in batch]
+    negatives_list = [item['negatives'] for item in batch]
+
+    # Get embedding indices if present
+    query_indices = [item.get('_query_idx') for item in batch if '_query_idx' in item]
+    pos_indices = [item.get('_pos_idx') for item in batch if '_pos_idx' in item]
+    neg_indices_list = [item.get('_neg_indices', []) for item in batch]
+
+    # Find max number of negatives in this batch
+    max_negatives = max(len(negs) for negs in negatives_list)
+
+    # Pad negatives to same length (repeat last negative if needed)
+    padded_negatives = []
+    padded_neg_indices = []
+    for i, negs in enumerate(negatives_list):
+        if len(negs) < max_negatives:
+            # Pad by repeating the last negative
+            padded = negs + [negs[-1]] * (max_negatives - len(negs))
+            # Pad indices too
+            neg_idx = neg_indices_list[i]
+            if neg_idx:
+                padded_idx = neg_idx + [neg_idx[-1]] * (max_negatives - len(neg_idx))
+            else:
+                padded_idx = []
+        else:
+            padded = negs
+            padded_idx = neg_indices_list[i] if i < len(neg_indices_list) else []
+        padded_negatives.append(padded)
+        padded_neg_indices.append(padded_idx)
+
+    result = {
+        'query': queries,
+        'positive': positives,
+        'negatives': padded_negatives
+    }
+
+    # Add embedding indices if present
+    if query_indices and all(idx is not None for idx in query_indices):
+        result['_query_indices'] = query_indices
+        result['_pos_indices'] = pos_indices
+        result['_neg_indices'] = padded_neg_indices
+
+    return result
 
 
 def train_phase1(student_model, teacher_model, config, device, checkpoint_path, rank=0):
@@ -59,9 +175,60 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
-    # Load dataset(s)
+    # Load dataset(s) - REQUIRES pre-computed embeddings
     datasets_config = config.get('datasets')
-    dataset = Phase1Dataset(datasets_config=datasets_config)
+    precomputed_embeddings_base_dir = config.get('precomputed_embeddings_dir', None)
+
+    if precomputed_embeddings_base_dir is None:
+        raise ValueError(
+            "Phase 1 requires pre-computed embeddings. Please:\n"
+            "1. Add 'precomputed_embeddings_dir' to your config\n"
+            "2. Run: torchrun --nproc_per_node=4 precompute_embeddings_v2.py --config configs/mrl.yaml --dataset <dataset_name>"
+        )
+
+    if is_main_process(rank):
+        logger.info(f"Loading pre-computed embeddings from {precomputed_embeddings_base_dir}")
+
+    # Load each dataset separately and concatenate
+    phase1_datasets = []
+    for dataset_cfg in datasets_config:
+        dataset_name = dataset_cfg['name']
+        max_samples = dataset_cfg.get('max_samples', None)
+
+        # Determine precision from directory name (default to fp16)
+        # Directory format: {base_dir}/{dataset_name}_{precision}/
+        import os
+        precision = 'fp16'  # default
+        for possible_precision in ['fp16', 'fp32']:
+            test_dir = os.path.join(precomputed_embeddings_base_dir, f"{dataset_name}_{possible_precision}")
+            if os.path.exists(test_dir):
+                precision = possible_precision
+                break
+
+        precomputed_dir = os.path.join(precomputed_embeddings_base_dir, f"{dataset_name}_{precision}")
+
+        if is_main_process(rank):
+            logger.info(f"Loading dataset: {dataset_name} from {precomputed_dir}")
+
+        ds = Phase1DatasetPrecomputed(
+            dataset_name=dataset_name,
+            precomputed_embeddings_dir=precomputed_dir,
+            max_samples=max_samples,
+            data_dir='./beir_datasets'
+        )
+        phase1_datasets.append(ds)
+
+    # Concatenate all datasets
+    if len(phase1_datasets) == 1:
+        dataset = phase1_datasets[0]
+    else:
+        dataset = MultiDatasetWrapper(phase1_datasets)
+        if is_main_process(rank):
+            logger.info(f"Concatenated {len(phase1_datasets)} datasets: total {len(dataset)} samples")
+
+    if is_main_process(rank):
+        logger.info("Using pre-computed teacher embeddings")
+        logger.info("Teacher model will not be used for Phase 1")
 
     # Use DistributedSampler for multi-GPU training
     world_size = get_world_size()
@@ -138,8 +305,9 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(pbar):
-            # Batch is a list of strings (both queries and documents)
-            texts = batch
+            # Batch contains tuples of (text, idx)
+            texts = [item[0] for item in batch]
+            indices = [item[1] for item in batch]
 
             # Tokenize inputs
             text_inputs = tokenizer(
@@ -150,20 +318,11 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
                 return_tensors='pt'
             ).to(device)
 
-            # Encode with teacher (frozen)
+            # Get teacher embeddings from pre-computed cache
             with torch.no_grad():
-                teacher_emb = teacher_model.encode(
-                    texts,
-                    convert_to_tensor=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
-                ).to(device).clone()  # Clone to convert from inference mode tensor
-
-                # Slice teacher embeddings to target dimension if not using projection (MRL)
-                if not use_projection:
-                    teacher_emb = teacher_emb[:, :target_dim]
-                    # Re-normalize after slicing
-                    teacher_emb = torch.nn.functional.normalize(teacher_emb, p=2, dim=-1)
+                # Load pre-computed embeddings from RAM to GPU
+                teacher_emb_np = np.array([dataset.get_embedding(idx) for idx in indices])
+                teacher_emb = torch.from_numpy(teacher_emb_np).to(device, dtype=torch.float32)
 
             # Encode with student using forward() for proper gradient flow
             _, student_emb = student_model(
@@ -258,16 +417,61 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
 
-    # Load dataset(s)
+    # Load dataset(s) - REQUIRES pre-computed embeddings
     datasets_config = config.get('datasets')
     num_negatives = config.get('num_negatives', 7)
+    precomputed_embeddings_base_dir = config.get('precomputed_embeddings_dir', None)
 
+    if precomputed_embeddings_base_dir is None:
+        raise ValueError(
+            "Phase 2 requires pre-computed embeddings. Please:\n"
+            "1. Add 'precomputed_embeddings_dir' to your config\n"
+            "2. Run: torchrun --nproc_per_node=4 precompute_embeddings_v2.py --config configs/mrl.yaml --dataset <dataset_name>"
+        )
 
-    dataset = Phase2Dataset(
-        datasets_config=datasets_config,
-        split='train',
-        num_negatives=num_negatives
-    )
+    if is_main_process(rank):
+        logger.info(f"Loading pre-computed embeddings from {precomputed_embeddings_base_dir}")
+
+    # Load each dataset separately and concatenate
+    phase2_datasets = []
+    for dataset_cfg in datasets_config:
+        dataset_name = dataset_cfg['name']
+        max_samples = dataset_cfg.get('max_samples', None)
+
+        # Determine precision from directory name (default to fp16)
+        import os
+        precision = 'fp16'  # default
+        for possible_precision in ['fp16', 'fp32']:
+            test_dir = os.path.join(precomputed_embeddings_base_dir, f"{dataset_name}_{possible_precision}")
+            if os.path.exists(test_dir):
+                precision = possible_precision
+                break
+
+        precomputed_dir = os.path.join(precomputed_embeddings_base_dir, f"{dataset_name}_{precision}")
+
+        if is_main_process(rank):
+            logger.info(f"Loading dataset: {dataset_name} from {precomputed_dir}")
+
+        ds = Phase2DatasetPrecomputed(
+            dataset_name=dataset_name,
+            precomputed_embeddings_dir=precomputed_dir,
+            num_negatives=num_negatives,
+            max_samples=max_samples,
+            data_dir='./beir_datasets'
+        )
+        phase2_datasets.append(ds)
+
+    # Concatenate all datasets
+    if len(phase2_datasets) == 1:
+        dataset = phase2_datasets[0]
+    else:
+        dataset = MultiDatasetWrapper(phase2_datasets)
+        if is_main_process(rank):
+            logger.info(f"Concatenated {len(phase2_datasets)} datasets: total {len(dataset)} samples")
+
+    if is_main_process(rank):
+        logger.info("Using pre-computed teacher embeddings")
+        logger.info("Teacher model will not be used for Phase 2")
 
     # Use DistributedSampler for multi-GPU training
     world_size = get_world_size()
@@ -349,6 +553,9 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             queries = batch['query']
             positives = batch['positive']
             negatives_list = batch['negatives']  # List of lists (now padded)
+            query_indices = batch['_query_indices']
+            pos_indices = batch['_pos_indices']
+            neg_indices_list = batch['_neg_indices']
 
             batch_size = len(queries)
 
@@ -367,20 +574,10 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 return_tensors='pt'
             ).to(device)
 
-            # Encode queries with teacher (frozen)
+            # Get teacher query embeddings from pre-computed cache
             with torch.no_grad():
-                teacher_query_emb = teacher_model.encode(
-                    queries,
-                    convert_to_tensor=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
-                ).to(device).clone()  # Clone to convert from inference mode tensor
-
-                # Slice teacher embeddings to target dimension if not using projection (MRL)
-                if not use_projection:
-                    teacher_query_emb = teacher_query_emb[:, :target_dim]
-                    # Re-normalize after slicing
-                    teacher_query_emb = torch.nn.functional.normalize(teacher_query_emb, p=2, dim=-1)
+                teacher_query_emb_np = np.array([dataset.get_query_embedding(idx) for idx in query_indices])
+                teacher_query_emb = torch.from_numpy(teacher_query_emb_np).to(device, dtype=torch.float32)
 
             # Encode queries with student using forward()
             _, student_query_emb = student_model(
@@ -393,7 +590,7 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             teacher_doc_embs = []
             student_doc_embs = []
 
-            for docs in all_docs:
+            for i, docs in enumerate(all_docs):
                 # Tokenize documents
                 doc_inputs = tokenizer(
                     docs,
@@ -403,21 +600,16 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                     return_tensors='pt'
                 ).to(device)
 
-                # Encode with teacher (frozen)
+                # Get teacher doc embeddings from pre-computed cache
                 with torch.no_grad():
-                    teacher_docs = teacher_model.encode(
-                        docs,
-                        convert_to_tensor=True,
-                        normalize_embeddings=True,
-                        show_progress_bar=False
-                    ).to(device).clone()  # Clone to convert from inference mode tensor
+                    # Load pre-computed embeddings: positive + negatives
+                    sample_idx = query_indices[i]  # Use query index to lookup sample
+                    pos_emb = dataset.get_positive_embedding(sample_idx)
+                    neg_embs = dataset.get_negative_embeddings(sample_idx)
 
-                    # Slice teacher embeddings to target dimension if not using projection (MRL)
-                    if not use_projection:
-                        teacher_docs = teacher_docs[:, :target_dim]
-                        # Re-normalize after slicing
-                        teacher_docs = torch.nn.functional.normalize(teacher_docs, p=2, dim=-1)
-
+                    # Combine: [positive, negative1, negative2, ...]
+                    doc_embs_np = np.vstack([pos_emb[np.newaxis, :], neg_embs])
+                    teacher_docs = torch.from_numpy(doc_embs_np).to(device, dtype=torch.float32)
                     teacher_doc_embs.append(teacher_docs)
 
                 # Encode with student using forward()

@@ -2,8 +2,8 @@
 
 from .models import ProjectionLayer, StudentModelWithProjection
 from .losses import Phase1Loss, Phase2Loss
-from .datasets import Phase1Dataset, Phase2Dataset, phase2_collate_fn
-from .train import train_phase1, train_phase2
+from .datasets import Phase1DatasetPrecomputed, Phase2DatasetPrecomputed
+from .train import train_phase1, train_phase2, phase2_collate_fn
 from .evaluate import evaluate_retrieval
 from .distributed import (
     setup_distributed,
@@ -22,8 +22,8 @@ __all__ = [
     'StudentModelWithProjection',
     'Phase1Loss',
     'Phase2Loss',
-    'Phase1Dataset',
-    'Phase2Dataset',
+    'Phase1DatasetPrecomputed',
+    'Phase2DatasetPrecomputed',
     'phase2_collate_fn',
     'train_phase1',
     'train_phase2',

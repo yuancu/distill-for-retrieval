@@ -96,6 +96,39 @@ class TrainingConfig:
         artifacts_dir = Path(self.paths['artifacts_dir'])
         return artifacts_dir / self.get_experiment_name()
 
+    def get_precomputed_embeddings_dir(self, dataset_names: list = None, precision: str = 'fp16') -> Optional[Path]:
+        """Get directory for pre-computed embeddings.
+
+        The path format is: {base_dir}/{dataset1}_{dataset2}_..._{precision}/
+        For example: ./cache/corpus_embedding/msmarco_fp16/
+
+        Args:
+            dataset_names: List of dataset names (if None, extracts from phase1 config)
+            precision: Precision string (default: 'fp16')
+
+        Returns:
+            Path to embeddings directory or None if precomputed_embeddings_dir not configured
+        """
+        if 'precomputed_embeddings_dir' not in self.config:
+            return None
+
+        base_dir = Path(self.config['precomputed_embeddings_dir'])
+
+        # Extract dataset names from phase1 config if not provided
+        if dataset_names is None:
+            dataset_names = []
+            if 'datasets' in self.phase1:
+                for ds_config in self.phase1['datasets']:
+                    dataset_names.append(ds_config['name'])
+
+        # Build subdirectory name: dataset1_dataset2_..._precision
+        if dataset_names:
+            subdir_name = '_'.join(dataset_names) + f'_{precision}'
+        else:
+            subdir_name = f'default_{precision}'
+
+        return base_dir / subdir_name
+
     def save_config_copy(self, dest_dir: Path):
         """Save a copy of the config file to destination directory.
 

@@ -163,15 +163,24 @@ def main():
     phase1_checkpoint = checkpoint_dir / "phase1_best"
     phase2_checkpoint = checkpoint_dir / "phase2_best"
 
-    # Load teacher model (frozen, not wrapped with DDP)
-    if is_main_process(rank):
-        logger.info(f"\nLoading teacher model: {config.model['teacher']}")
+    # Check if using pre-computed embeddings
+    # The config method will generate the proper path based on dataset name
+    precomputed_embeddings_dir = config.get_precomputed_embeddings_dir()
 
-    teacher_model = SentenceTransformer(config.model['teacher'])
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-    teacher_model = teacher_model.to(device)
+    # Load teacher model only if not using pre-computed embeddings
+    teacher_model = None
+    if precomputed_embeddings_dir is None:
+        if is_main_process(rank):
+            logger.info(f"\nLoading teacher model: {config.model['teacher']}")
+
+        teacher_model = SentenceTransformer(config.model['teacher'])
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        teacher_model = teacher_model.to(device)
+    else:
+        if is_main_process(rank):
+            logger.info(f"\nSkipping teacher model loading (using pre-computed embeddings from {precomputed_embeddings_dir})")
 
     # Create student model
     if is_main_process(rank):

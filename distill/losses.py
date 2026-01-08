@@ -13,7 +13,7 @@ class Phase1Loss(nn.Module):
         self.cosine_weight = cosine_weight
 
     def forward(self, student_emb, teacher_emb):
-        """Both embeddings should be normalized (3584d)"""
+        """Both embeddings should be normalized"""
         # MSE loss on normalized embeddings
         mse_loss = F.mse_loss(student_emb, teacher_emb)
 

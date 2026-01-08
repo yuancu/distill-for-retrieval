@@ -1,311 +1,311 @@
-"""Dataset classes for distillation."""
+"""Simplified dataset classes for pre-computed embeddings.
+
+These datasets load pre-computed query and corpus embeddings and build
+training samples on-demand.
+"""
 
 import logging
-import os
+import json
+import numpy as np
 import random
+from pathlib import Path
 from torch.utils.data import Dataset
-from datasets import load_dataset
-from tqdm.auto import tqdm
 from beir import util as beir_util
 from beir.datasets.data_loader import GenericDataLoader
 
 logger = logging.getLogger(__name__)
 
 
-class Phase1Dataset(Dataset):
-    """Dataset for Phase 1: General distillation with diverse data
+class Phase1DatasetPrecomputed(Dataset):
+    """Phase 1 dataset using pre-computed query and corpus embeddings.
 
-    Supports loading multiple datasets from BEIR benchmark using the beir library.
-    Datasets are downloaded and cached locally for efficient loading.
-
-    For Phase 1 (pure distillation), queries and documents are randomly sampled
-    separately with a 1:19 ratio (5% queries, 95% documents). Queries get an
-    instruction prefix while documents don't. No pairing is needed.
-
-    Returns a simple list of strings (not dictionaries) for uniform processing
-    during training without query/document discrimination.
-
-    Supported datasets: msmarco, nfcorpus, trec-covid, nq, hotpotqa, fiqa,
-                       arguana, scidocs, scifact, touche-2020, quora,
-                       dbpedia-entity, fever, climate-fever, signal1m
+    Loads queries.mmap and corpus.mmap, concatenates them in order
+    (queries first, then corpus). No shuffling or sampling ratio.
 
     Args:
-        datasets_config: List of dataset configurations, each with 'name' and 'max_samples'
-                        Example: [{'name': 'msmarco', 'max_samples': 100000},
-                                 {'name': 'nfcorpus', 'max_samples': 10000}]
-        max_samples_per_dataset: (deprecated) Fallback for backward compatibility
-        data_dir: Directory to store downloaded BEIR datasets (default: './beir_datasets')
-
-    Returns:
-        String: A text sample (either query with prefix or document without prefix)
+        dataset_name: BEIR dataset name (e.g., 'msmarco')
+        precomputed_embeddings_dir: Directory containing queries.mmap and corpus.mmap
+        max_samples: Maximum number of samples (optional, truncates if set)
+        data_dir: Directory for BEIR datasets (to load text samples)
     """
-    def __init__(self, datasets_config=None, max_samples_per_dataset=100000, data_dir='./beir_datasets'):
-        self.samples = []
+
+    def __init__(self, dataset_name, precomputed_embeddings_dir, max_samples=None, data_dir='./beir_datasets'):
+        self.dataset_name = dataset_name
+        self.precomputed_embeddings_dir = Path(precomputed_embeddings_dir)
+        self.max_samples = max_samples
         self.data_dir = data_dir
 
-        # Backward compatibility: if no config provided, use default MS MARCO
-        if datasets_config is None:
-            datasets_config = [{'name': 'msmarco', 'max_samples': max_samples_per_dataset}]
+        # Load metadata
+        metadata_path = self.precomputed_embeddings_dir / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata not found: {metadata_path}")
 
-        logger.info("Loading Phase 1 datasets...")
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
 
-        for dataset_cfg in datasets_config:
-            dataset_name = dataset_cfg['name'].lower()
-            max_samples = dataset_cfg.get('max_samples', max_samples_per_dataset)
-
-            try:
-                # List of datasets available in BEIR
-                beir_datasets = ['msmarco', 'nfcorpus', 'trec-covid', 'nq', 'hotpotqa',
-                                 'fiqa', 'arguana', 'scidocs', 'scifact',
-                                 'touche-2020', 'quora', 'dbpedia-entity',
-                                 'fever', 'climate-fever', 'signal1m']
-
-                if dataset_name in beir_datasets:
-                    self._load_beir_dataset(dataset_name, max_samples)
-                else:
-                    logger.warning(f"Unknown dataset: {dataset_name}, skipping...")
-            except Exception as e:
-                logger.warning(f"Could not load {dataset_name}: {e}")
-
-        logger.info(f"Total Phase 1 samples: {len(self.samples)}")
-
-    def _load_beir_dataset(self, dataset_name, max_samples):
-        """Load BEIR dataset using beir library.
-
-        For Phase 1 (distillation), randomly samples queries and documents separately
-        with a 1:19 ratio. Queries get instruction prefix, documents don't.
-        """
-        logger.info(f"Loading BEIR dataset '{dataset_name}' (max {max_samples} samples)...")
-
-        # Download and unzip dataset
+        # Load BEIR dataset for text samples
+        logger.info(f"Loading BEIR dataset: {dataset_name}")
         url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
-        data_path = beir_util.download_and_unzip(url, self.data_dir)
-
-        # Load corpus and queries (no need for qrels in Phase 1)
+        data_path = beir_util.download_and_unzip(url, data_dir)
         corpus, queries, _ = GenericDataLoader(data_folder=data_path).load(split="train")
 
-        # Sample with 1:19 ratio (1 query : 19 docs)
-        # Total samples = max_samples, so queries = max_samples / 20, docs = max_samples * 19 / 20
-        num_queries = max_samples // 20
-        num_docs = max_samples - num_queries
+        # Get query instruction from metadata
+        query_instruction = self.metadata.get('query_instruction', '')
 
-        # Extract and add queries with instruction prefix (no shuffling needed)
-        query_instruction = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
-        count_queries = 0
-        for query_id, query_text in queries.items():
-            if count_queries >= num_queries:
-                break
-            if query_text.strip():
-                self.samples.append(query_instruction + query_text)
-                count_queries += 1
+        # Build samples list: queries first, then corpus (in order)
+        self.samples = []
+        self.embedding_indices = []
 
-        # Extract and add documents (no shuffling needed)
-        count_docs = 0
-        for doc_id, doc in corpus.items():
-            if count_docs >= num_docs:
-                break
-            doc_text = doc.get('title', '') + ' ' + doc.get('text', '')
-            doc_text = doc_text.strip()
-            if doc_text:
-                self.samples.append(doc_text)
-                count_docs += 1
+        # Add queries
+        query_ids = self.metadata['query_ids']
+        for i, qid in enumerate(query_ids):
+            if qid in queries:
+                text = query_instruction + queries[qid]
+                self.samples.append(text)
+                self.embedding_indices.append(i)  # Index in queries.mmap
 
-        random.shuffle(self.samples)
-        logger.info(f"Loaded {count_queries} queries and {count_docs} docs from {dataset_name} (total: {count_queries + count_docs} samples)")
+        num_queries = len(self.samples)
+
+        # Add corpus
+        corpus_ids = self.metadata['corpus_ids']
+        for i, doc_id in enumerate(corpus_ids):
+            if doc_id in corpus:
+                doc = corpus[doc_id]
+                text = doc.get('title', '') + ' ' + doc.get('text', '')
+                self.samples.append(text.strip())
+                # Index in concatenated embeddings (queries + corpus)
+                self.embedding_indices.append(num_queries + i)
+
+        logger.info(f"Loaded {num_queries} queries and {len(corpus_ids)} corpus ({len(self.samples)} total)")
+
+        # Truncate if max_samples is set
+        if max_samples is not None and max_samples < len(self.samples):
+            logger.info(f"Truncating to {max_samples} samples")
+            self.samples = self.samples[:max_samples]
+            self.embedding_indices = self.embedding_indices[:max_samples]
+
+        # Load embeddings into RAM
+        self._load_embeddings()
+
+    def _load_embeddings(self):
+        """Load pre-computed embeddings into RAM."""
+        dtype_str = self.metadata.get('dtype', 'float16')
+
+        # Load queries
+        query_shape = tuple(self.metadata['query_embeddings_shape'])
+        query_path = self.precomputed_embeddings_dir / "queries.mmap"
+        query_memmap = np.memmap(str(query_path), dtype=dtype_str, mode='r', shape=query_shape)
+        query_embeddings = np.array(query_memmap)
+
+        # Load corpus
+        corpus_shape = tuple(self.metadata['corpus_embeddings_shape'])
+        corpus_path = self.precomputed_embeddings_dir / "corpus.mmap"
+        corpus_memmap = np.memmap(str(corpus_path), dtype=dtype_str, mode='r', shape=corpus_shape)
+        corpus_embeddings = np.array(corpus_memmap)
+
+        # Concatenate: queries first, then corpus
+        self.embeddings = np.concatenate([query_embeddings, corpus_embeddings], axis=0)
+
+        # Truncate embeddings if needed
+        if self.max_samples is not None and self.max_samples < self.embeddings.shape[0]:
+            self.embeddings = self.embeddings[:self.max_samples]
+
+        self.embedding_dim = self.embeddings.shape[1]
+
+        bytes_per_elem = 2 if dtype_str == 'float16' else 4
+        size_mb = (self.embeddings.shape[0] * self.embeddings.shape[1] * bytes_per_elem) / (1024 * 1024)
+        logger.info(f"Loaded embeddings into RAM: {self.embeddings.shape} ({size_mb:.2f} MB)")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        """Return (text, embedding_index)."""
+        text = self.samples[idx]
+        emb_idx = self.embedding_indices[idx]
+        return text, emb_idx
+
+    def get_embedding(self, idx):
+        """Get embedding by sample index."""
+        emb_idx = self.embedding_indices[idx]
+        return self.embeddings[emb_idx]
 
 
-class Phase2Dataset(Dataset):
-    """Dataset for Phase 2: Task-specific training with hard negatives
+class Phase2DatasetPrecomputed(Dataset):
+    """Phase 2 dataset using pre-computed query and corpus embeddings.
 
-    Supports loading multiple datasets from BEIR benchmark using the beir library.
-    Datasets are downloaded and cached locally. Creates training samples with
-    one positive and multiple hard negative documents per query.
-
-    Supported datasets: msmarco, nfcorpus, trec-covid, nq, hotpotqa, fiqa,
-                       arguana, scidocs, scifact, touche-2020, quora,
-                       dbpedia-entity, fever, climate-fever, signal1m
+    Builds query-document triplets on-demand from qrels using pre-computed embeddings.
 
     Args:
-        datasets_config: List of dataset configurations, each with 'name' and 'max_samples'
-                        Example: [{'name': 'msmarco', 'max_samples': 500000},
-                                 {'name': 'nfcorpus', 'max_samples': 50000}]
-        split: Dataset split to use (default: 'train')
-        num_negatives: Number of hard negatives per query (default: 7)
-        data_dir: Directory to store downloaded BEIR datasets (default: './beir_datasets')
-        dataset_name: (deprecated) Fallback for backward compatibility
-        max_samples: (deprecated) Fallback for backward compatibility
+        dataset_name: BEIR dataset name
+        precomputed_embeddings_dir: Directory containing queries.mmap and corpus.mmap
+        num_negatives: Number of hard negatives per query
+        max_samples: Maximum number of query samples
+        data_dir: Directory for BEIR datasets
     """
-    def __init__(self, datasets_config=None, split='train', num_negatives=7, data_dir='./beir_datasets', dataset_name=None, max_samples=None):
-        self.samples = []
+
+    def __init__(self, dataset_name, precomputed_embeddings_dir, num_negatives=7,
+                 max_samples=None, data_dir='./beir_datasets'):
+        self.dataset_name = dataset_name
+        self.precomputed_embeddings_dir = Path(precomputed_embeddings_dir)
         self.num_negatives = num_negatives
+        self.max_samples = max_samples
         self.data_dir = data_dir
-        self.split = split
 
-        # Backward compatibility: if no config provided, use old API
-        if datasets_config is None:
-            if dataset_name is None:
-                dataset_name = 'msmarco'
-            if max_samples is None:
-                max_samples = 500000
-            datasets_config = [{'name': dataset_name, 'max_samples': max_samples}]
+        # Load metadata
+        metadata_path = self.precomputed_embeddings_dir / "metadata.json"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata not found: {metadata_path}")
 
-        logger.info("Loading Phase 2 datasets...")
+        with open(metadata_path, 'r') as f:
+            self.metadata = json.load(f)
 
-        for dataset_cfg in datasets_config:
-            dataset_name = dataset_cfg['name'].lower()
-            max_samples = dataset_cfg.get('max_samples', 500000)
-
-            try:
-                # List of datasets available in BEIR
-                beir_datasets = ['msmarco', 'nfcorpus', 'trec-covid', 'nq', 'hotpotqa',
-                                 'fiqa', 'arguana', 'scidocs', 'scifact',
-                                 'touche-2020', 'quora', 'dbpedia-entity',
-                                 'fever', 'climate-fever', 'signal1m']
-
-                if dataset_name in beir_datasets:
-                    self._load_beir_dataset(dataset_name, max_samples)
-                else:
-                    logger.warning(f"Unknown dataset: {dataset_name}, skipping...")
-            except Exception as e:
-                logger.warning(f"Could not load {dataset_name} for Phase 2: {e}")
-
-        logger.info(f"Total Phase 2 samples: {len(self.samples)}")
-
-    def _load_beir_dataset(self, dataset_name, max_samples):
-        """Load BEIR dataset with hard negatives using beir library.
-
-        Downloads the dataset if not cached and loads corpus, queries, and qrels.
-        Creates samples with one positive and multiple hard negative documents.
-        """
-        logger.info(f"Loading BEIR dataset '{dataset_name}' for Phase 2 (max {max_samples} samples)...")
-
-        # Download and unzip dataset
+        # Load BEIR dataset
+        logger.info(f"Loading BEIR dataset: {dataset_name}")
         url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
-        data_path = beir_util.download_and_unzip(url, self.data_dir)
+        data_path = beir_util.download_and_unzip(url, data_dir)
+        self.corpus, self.queries, self.qrels = GenericDataLoader(data_folder=data_path).load(split="train")
 
-        # Load corpus, queries, and qrels using GenericDataLoader
-        corpus, queries, qrels = GenericDataLoader(data_folder=data_path).load(split=self.split)
+        # Build ID to index mappings
+        self.query_ids = self.metadata['query_ids']
+        self.corpus_ids = self.metadata['corpus_ids']
+        self.query_id_to_idx = {qid: i for i, qid in enumerate(self.query_ids)}
+        self.corpus_id_to_idx = {doc_id: i for i, doc_id in enumerate(self.corpus_ids)}
 
-        # Convert corpus keys to list once for efficient sampling
-        all_corpus_ids = list(corpus.keys())
+        # Build training samples from qrels
+        self._build_samples()
 
-        # Create query-document pairs with hard negatives from qrels
-        count = 0
-        for query_id, doc_scores in tqdm(qrels.items(), desc=f"Processing {dataset_name} samples", total=max_samples):
-            if count >= max_samples:
-                break
+        # Load embeddings
+        self._load_embeddings()
 
-            if query_id not in queries:
+    def _build_samples(self):
+        """Build training samples from qrels."""
+        self.samples = []
+
+        for query_id, doc_scores in self.qrels.items():
+            if query_id not in self.queries or query_id not in self.query_id_to_idx:
                 continue
 
-            query_text = queries[query_id]
-
-            # Separate positive and negative documents based on relevance score
+            # Separate positive and negative documents
             positive_docs = [(doc_id, score) for doc_id, score in doc_scores.items() if score > 0]
             negative_docs = [(doc_id, score) for doc_id, score in doc_scores.items() if score == 0]
 
             if not positive_docs:
                 continue
 
-            # Use the document with highest relevance score as positive
+            # Use highest scoring positive document
             pos_doc_id, _ = max(positive_docs, key=lambda x: x[1])
-
-            if pos_doc_id not in corpus:
-                continue
-
-            # Get positive passage text (combine title and text)
-            pos_doc = corpus[pos_doc_id]
-            positive_text = pos_doc.get('title', '') + ' ' + pos_doc.get('text', '')
-            positive_text = positive_text.strip()
-
-            if not positive_text:
+            if pos_doc_id not in self.corpus or pos_doc_id not in self.corpus_id_to_idx:
                 continue
 
             # Collect hard negatives
-            negative_passages = []
+            negative_doc_ids = []
             for neg_doc_id, _ in negative_docs:
-                if len(negative_passages) >= self.num_negatives:
+                if len(negative_doc_ids) >= self.num_negatives:
                     break
+                if neg_doc_id in self.corpus and neg_doc_id in self.corpus_id_to_idx:
+                    negative_doc_ids.append(neg_doc_id)
 
-                if neg_doc_id in corpus:
-                    neg_doc = corpus[neg_doc_id]
-                    neg_text = neg_doc.get('title', '') + ' ' + neg_doc.get('text', '')
-                    neg_text = neg_text.strip()
-                    if neg_text:
-                        negative_passages.append(neg_text)
-
-            # If not enough explicit negatives, sample random documents
-            if len(negative_passages) < self.num_negatives:
-                # Get document IDs not in this query's relevance judgments
+            # Sample random negatives if needed
+            if len(negative_doc_ids) < self.num_negatives:
                 judged_doc_ids = set(doc_scores.keys())
-                num_needed = self.num_negatives - len(negative_passages)
+                available_corpus_ids = [
+                    doc_id for doc_id in self.corpus_ids
+                    if doc_id not in judged_doc_ids and doc_id in self.corpus
+                ]
+                num_needed = self.num_negatives - len(negative_doc_ids)
+                if len(available_corpus_ids) >= num_needed:
+                    sampled = random.sample(available_corpus_ids, num_needed)
+                    negative_doc_ids.extend(sampled)
 
-                # Randomly sample needed negatives (with some buffer for empty docs)
-                sample_size = min(num_needed * 3, len(all_corpus_ids))  # 3x buffer for empty/invalid docs
-                sampled_ids = random.sample(all_corpus_ids, sample_size)
-
-                for doc_id in sampled_ids:
-                    if len(negative_passages) >= self.num_negatives:
-                        break
-
-                    # Skip judged documents
-                    if doc_id in judged_doc_ids:
-                        continue
-
-                    neg_doc = corpus[doc_id]
-                    neg_text = neg_doc.get('title', '') + ' ' + neg_doc.get('text', '')
-                    neg_text = neg_text.strip()
-                    if neg_text:
-                        negative_passages.append(neg_text)
-
-            # Only add sample if we have at least one negative
-            if negative_passages:
+            # Only add if we have at least one negative
+            if negative_doc_ids:
                 self.samples.append({
-                    'query': query_text,
-                    'positive': positive_text,
-                    'negatives': negative_passages[:self.num_negatives]
+                    'query_id': query_id,
+                    'pos_doc_id': pos_doc_id,
+                    'neg_doc_ids': negative_doc_ids[:self.num_negatives]
                 })
-                count += 1
 
-        logger.info(f"Loaded {count} {dataset_name} samples with hard negatives")
+            if self.max_samples and len(self.samples) >= self.max_samples:
+                break
+
+        logger.info(f"Built {len(self.samples)} Phase 2 training samples")
+
+    def _load_embeddings(self):
+        """Load pre-computed embeddings into RAM."""
+        dtype_str = self.metadata.get('dtype', 'float16')
+
+        # Load queries
+        query_shape = tuple(self.metadata['query_embeddings_shape'])
+        query_path = self.precomputed_embeddings_dir / "queries.mmap"
+        query_memmap = np.memmap(str(query_path), dtype=dtype_str, mode='r', shape=query_shape)
+        self.query_embeddings = np.array(query_memmap)
+
+        # Load corpus
+        corpus_shape = tuple(self.metadata['corpus_embeddings_shape'])
+        corpus_path = self.precomputed_embeddings_dir / "corpus.mmap"
+        corpus_memmap = np.memmap(str(corpus_path), dtype=dtype_str, mode='r', shape=corpus_shape)
+        self.corpus_embeddings = np.array(corpus_memmap)
+
+        self.embedding_dim = query_shape[1]
+
+        bytes_per_elem = 2 if dtype_str == 'float16' else 4
+        query_mb = (query_shape[0] * query_shape[1] * bytes_per_elem) / (1024 * 1024)
+        corpus_mb = (corpus_shape[0] * corpus_shape[1] * bytes_per_elem) / (1024 * 1024)
+
+        logger.info(f"Loaded embeddings into RAM:")
+        logger.info(f"  Queries: {query_shape} ({query_mb:.2f} MB)")
+        logger.info(f"  Corpus: {corpus_shape} ({corpus_mb:.2f} MB)")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        """Return sample dict with texts and _emb_idx for embedding lookup."""
+        sample = self.samples[idx]
 
+        query_id = sample['query_id']
+        pos_doc_id = sample['pos_doc_id']
+        neg_doc_ids = sample['neg_doc_ids']
 
-def phase2_collate_fn(batch):
-    """Custom collate function to handle variable-length negatives
+        # Get texts
+        query_instruction = self.metadata.get('query_instruction', '')
+        query_text = query_instruction + self.queries[query_id]
 
-    Pads negatives to the same length within batch
-    """
-    queries = [item['query'] for item in batch]
-    positives = [item['positive'] for item in batch]
-    negatives_list = [item['negatives'] for item in batch]
+        pos_doc = self.corpus[pos_doc_id]
+        pos_text = pos_doc.get('title', '') + ' ' + pos_doc.get('text', '')
+        pos_text = pos_text.strip()
 
-    # Find max number of negatives in this batch
-    max_negatives = max(len(negs) for negs in negatives_list)
+        neg_texts = []
+        for neg_doc_id in neg_doc_ids:
+            if neg_doc_id in self.corpus:
+                neg_doc = self.corpus[neg_doc_id]
+                neg_text = neg_doc.get('title', '') + ' ' + neg_doc.get('text', '')
+                neg_texts.append(neg_text.strip())
 
-    # Pad negatives to same length (repeat last negative if needed)
-    padded_negatives = []
-    for negs in negatives_list:
-        if len(negs) < max_negatives:
-            # Pad by repeating the last negative
-            padded = negs + [negs[-1]] * (max_negatives - len(negs))
-        else:
-            padded = negs
-        padded_negatives.append(padded)
+        return {
+            'query': query_text,
+            'positive': pos_text,
+            'negatives': neg_texts,
+            '_query_idx': self.query_id_to_idx[query_id],
+            '_pos_idx': self.corpus_id_to_idx[pos_doc_id],
+            '_neg_indices': [self.corpus_id_to_idx[nid] for nid in neg_doc_ids if nid in self.corpus_id_to_idx]
+        }
 
-    return {
-        'query': queries,
-        'positive': positives,
-        'negatives': padded_negatives
-    }
+    def get_query_embedding(self, idx):
+        """Get query embedding by sample index."""
+        sample = self.samples[idx]
+        query_idx = self.query_id_to_idx[sample['query_id']]
+        return self.query_embeddings[query_idx]
+
+    def get_positive_embedding(self, idx):
+        """Get positive document embedding by sample index."""
+        sample = self.samples[idx]
+        pos_idx = self.corpus_id_to_idx[sample['pos_doc_id']]
+        return self.corpus_embeddings[pos_idx]
+
+    def get_negative_embeddings(self, idx):
+        """Get negative document embeddings by sample index."""
+        sample = self.samples[idx]
+        neg_indices = [self.corpus_id_to_idx[nid] for nid in sample['neg_doc_ids'] if nid in self.corpus_id_to_idx]
+        return self.corpus_embeddings[neg_indices]
