@@ -123,12 +123,15 @@ def encode_texts_sharded(teacher_model, texts, device, batch_size, dtype, rank, 
             batch_end = min(batch_start + batch_size, len(shard_texts))
             batch_texts = shard_texts[batch_start:batch_end]
 
+            # Use encode with proper batch_size parameter
+            # Note: SentenceTransformer.encode() may internally re-batch
             embeddings = teacher_model.encode(
                 batch_texts,
                 convert_to_tensor=True,
                 normalize_embeddings=True,
                 show_progress_bar=False,
-                batch_size=len(batch_texts)
+                batch_size=batch_size,  # Use the outer batch_size, not len(batch_texts)
+                device=device
             )
 
             # Convert to specified dtype
@@ -238,6 +241,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=512, help='Batch size for encoding (default: 512)')
     parser.add_argument('--precision', type=str, default='fp16', choices=['fp16', 'fp32'], help='Embedding precision (default: fp16)')
     parser.add_argument('--data-dir', type=str, default='./beir_datasets', help='Directory for BEIR datasets')
+    parser.add_argument('--max-length', type=int, help="Max length of the texts")
     args = parser.parse_args()
 
     # Setup distributed training
@@ -278,7 +282,27 @@ def main():
     # Load teacher model (all ranks)
     if is_main_process(rank):
         logger.info(f"Loading teacher model: {config.model['teacher']}")
-    teacher_model = SentenceTransformer(config.model['teacher'])
+
+    # Determine torch dtype for model loading
+    torch_dtype = torch.float16 if args.precision == 'fp16' else torch.float32
+    np_dtype = 'float16' if args.precision == 'fp16' else 'float32'
+
+    teacher_model = SentenceTransformer(
+        config.model['teacher'],
+        trust_remote_code=True,
+        model_kwargs={"dtype": torch_dtype}
+        # DO NOT use backend="onnx" - it's slow for large models!
+    )
+
+    # Set max sequence length (optional - override model default)
+    if args.max_length is not None:
+        teacher_model.max_seq_length = args.max_length
+        if is_main_process(rank):
+            logger.info(f"Set max_seq_length to: {args.max_length}")
+    else:
+        if is_main_process(rank):
+            logger.info(f"Using model default max_seq_length: {teacher_model.max_seq_length}")
+
     teacher_model.eval()
     teacher_model = teacher_model.to(device)
 
@@ -296,8 +320,6 @@ def main():
     if is_main_process(rank):
         logger.info(f"Teacher embedding dimension: {embedding_dim}")
         logger.info(f"Target dimension: {target_dim}")
-
-    np_dtype = 'float16' if args.precision == 'fp16' else 'float32'
 
     # Load BEIR dataset (all ranks)
     corpus, queries = load_beir_dataset(args.dataset, args.data_dir)
@@ -317,6 +339,40 @@ def main():
     if is_main_process(rank):
         logger.info(f"Total queries: {len(query_texts)}")
         logger.info(f"Total corpus: {len(corpus_texts)}")
+
+    # Encode corpus first (larger dataset)
+    if is_main_process(rank):
+        logger.info("\n" + "=" * 80)
+        logger.info("Encoding Corpus")
+        logger.info("=" * 80)
+
+    local_corpus_embs = encode_texts_sharded(
+        teacher_model, corpus_texts, device, args.batch_size, np_dtype, rank, world_size
+    )
+
+    # Slice to target dimension if MRL mode
+    if not use_projection and local_corpus_embs.shape[0] > 0:
+        local_corpus_embs = local_corpus_embs[:, :target_dim]
+        norms = np.linalg.norm(local_corpus_embs, axis=1, keepdims=True)
+        local_corpus_embs = (local_corpus_embs / norms).astype(np_dtype)
+
+    # Gather corpus
+    if is_main_process(rank):
+        logger.info("Gathering corpus embeddings from all GPUs...")
+    corpus_embeddings = gather_embeddings_from_all_ranks(local_corpus_embs, rank, world_size)
+
+    # Save corpus embeddings immediately (rank 0 only)
+    if is_main_process(rank):
+        logger.info("\n" + "=" * 80)
+        logger.info("Saving Corpus Embeddings")
+        logger.info("=" * 80)
+
+        corpus_path = output_dir / "corpus.mmap"
+        save_embeddings_memmap(corpus_embeddings, corpus_path, dtype=np_dtype)
+        logger.info("✓ Corpus embeddings saved successfully")
+
+        # Free memory
+        del corpus_embeddings
 
     # Encode queries
     if is_main_process(rank):
@@ -339,42 +395,22 @@ def main():
         logger.info("Gathering query embeddings from all GPUs...")
     query_embeddings = gather_embeddings_from_all_ranks(local_query_embs, rank, world_size)
 
-    # Encode corpus
+    # Save query embeddings immediately (rank 0 only)
     if is_main_process(rank):
         logger.info("\n" + "=" * 80)
-        logger.info("Encoding Corpus")
+        logger.info("Saving Query Embeddings")
         logger.info("=" * 80)
 
-    local_corpus_embs = encode_texts_sharded(
-        teacher_model, corpus_texts, device, args.batch_size, np_dtype, rank, world_size
-    )
-
-    # Slice to target dimension if MRL mode
-    if not use_projection and local_corpus_embs.shape[0] > 0:
-        local_corpus_embs = local_corpus_embs[:, :target_dim]
-        norms = np.linalg.norm(local_corpus_embs, axis=1, keepdims=True)
-        local_corpus_embs = (local_corpus_embs / norms).astype(np_dtype)
-
-    # Gather corpus
-    if is_main_process(rank):
-        logger.info("Gathering corpus embeddings from all GPUs...")
-    corpus_embeddings = gather_embeddings_from_all_ranks(local_corpus_embs, rank, world_size)
-
-    # Save embeddings (rank 0 only)
-    if is_main_process(rank):
-        logger.info("\n" + "=" * 80)
-        logger.info("Saving Embeddings")
-        logger.info("=" * 80)
-
-        # Save queries
         queries_path = output_dir / "queries.mmap"
-        save_embeddings_memmap(query_embeddings, queries_path, dtype=np_dtype)
-
-        # Save corpus
-        corpus_path = output_dir / "corpus.mmap"
-        save_embeddings_memmap(corpus_embeddings, corpus_path, dtype=np_dtype)
+        if query_embeddings is not None:
+            save_embeddings_memmap(query_embeddings, queries_path, dtype=np_dtype)
+            logger.info("✓ Query embeddings saved successfully")
+            query_shape = query_embeddings.shape
+        else:
+            raise RuntimeError("Query embeddings is None on rank 0")
 
         # Save metadata
+        corpus_path = output_dir / "corpus.mmap"
         metadata = {
             'dataset': args.dataset,
             'teacher_model': config.model['teacher'],
@@ -388,8 +424,8 @@ def main():
             'num_corpus': len(corpus_ids),
             'query_ids': query_ids,
             'corpus_ids': corpus_ids,
-            'query_embeddings_shape': list(query_embeddings.shape),
-            'corpus_embeddings_shape': list(corpus_embeddings.shape),
+            'query_embeddings_shape': list(query_shape),
+            'corpus_embeddings_shape': [len(corpus_ids), target_dim],  # Use expected shape since corpus_embeddings is already freed
             'queries_path': str(queries_path),
             'corpus_path': str(corpus_path),
         }
@@ -401,8 +437,8 @@ def main():
 
         logger.info("\n" + "=" * 80)
         logger.info("Pre-computation Complete!")
-        logger.info(f"  Queries: {query_embeddings.shape}")
-        logger.info(f"  Corpus: {corpus_embeddings.shape}")
+        logger.info(f"  Corpus: {len(corpus_ids)} documents × {target_dim}d")
+        logger.info(f"  Queries: {query_shape[0]} queries × {query_shape[1]}d")
         logger.info("=" * 80)
 
     cleanup_distributed()

@@ -1,9 +1,18 @@
 # MRL-based distillation configuration (no projection)
 # This config uses direct distillation from teacher's first 768d to student
 
+# Query instruction for retrieval
+query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+
+# Pre-computed embeddings (optional, for faster training)
+# Uncomment to use pre-computed teacher embeddings
+# Format: {base_dir}/{dataset_name}_{precision}/
+# Example: ./cache/embedding/msmarco_fp16/
+precomputed_embeddings_dir: "./cache/embedding/"
+
 # Model configuration
 model:
-  teacher: "infly/inf-retriever-v1-pro"
+  teacher: "infly/inf-retriever-v1"
   student: "sentence-transformers/all-mpnet-base-v2"
   teacher_dim: 3584
   student_dim: 768
@@ -19,15 +28,15 @@ phase1:
   #                          fiqa, arguana, scidocs, scifact, etc.
   datasets:
     - name: "msmarco"
-      max_samples: 1000000
+      max_samples: 10000000
 
   # Training hyperparameters
   batch_size: 64
   learning_rate: 2.0e-5
   warmup_steps: 1000
-  num_epochs: 1
-  mse_weight: 0.4
-  cosine_weight: 0.6
+  num_epochs: 2
+  mse_weight: 1
+  cosine_weight: 0
   max_length: 512
   gradient_accumulation_steps: 4
 
@@ -37,6 +46,8 @@ phase2:
   datasets:
     - name: "msmarco"
       max_samples: 500000
+    - name: "nfcorpus"
+      max_samples: 100000
 
   # Training hyperparameters
   batch_size: 16
