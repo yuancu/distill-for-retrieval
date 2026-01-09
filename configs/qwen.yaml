@@ -1,5 +1,5 @@
-# MRL-based distillation configuration (no projection)
-# This config uses direct distillation from teacher's first 768d to student
+# Qwen as student model distillation configuration (no projection)
+# This config uses direct distillation from teacher's first 1024d to student
 
 # Query instruction for retrieval
 query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
@@ -46,8 +46,6 @@ phase2:
   datasets:
     - name: "msmarco"
       max_samples: 10000000
-    - name: "nfcorpus"
-      max_samples: 1000000
 
   # Training hyperparameters
   batch_size: 64

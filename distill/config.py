@@ -96,15 +96,16 @@ class TrainingConfig:
         artifacts_dir = Path(self.paths['artifacts_dir'])
         return artifacts_dir / self.get_experiment_name()
 
-    def get_precomputed_embeddings_dir(self, dataset_names: list = None, precision: str = 'fp16') -> Optional[Path]:
+    def get_precomputed_embeddings_dir(self, dataset_names: list = None, precision: str = 'fp16', dim: Optional[int] = None) -> Optional[Path]:
         """Get directory for pre-computed embeddings.
 
-        The path format is: {base_dir}/{dataset1}_{dataset2}_..._{precision}/
-        For example: ./cache/corpus_embedding/msmarco_fp16/
+        The path format is: {base_dir}/{dataset1}_{dataset2}_..._{precision}_{dim}/
+        For example: ./cache/corpus_embedding/msmarco_fp16_768/
 
         Args:
             dataset_names: List of dataset names (if None, extracts from phase1 config)
             precision: Precision string (default: 'fp16')
+            dim: Optional dimension (if specified, adds dimension to folder name)
 
         Returns:
             Path to embeddings directory or None if precomputed_embeddings_dir not configured
@@ -121,11 +122,15 @@ class TrainingConfig:
                 for ds_config in self.phase1['datasets']:
                     dataset_names.append(ds_config['name'])
 
-        # Build subdirectory name: dataset1_dataset2_..._precision
+        # Build subdirectory name: dataset1_dataset2_..._precision[_dim]
         if dataset_names:
             subdir_name = '_'.join(dataset_names) + f'_{precision}'
+            if dim is not None:
+                subdir_name += f'_{dim}'
         else:
             subdir_name = f'default_{precision}'
+            if dim is not None:
+                subdir_name += f'_{dim}'
 
         return base_dir / subdir_name
 

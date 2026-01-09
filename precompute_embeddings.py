@@ -242,6 +242,7 @@ def main():
     parser.add_argument('--precision', type=str, default='fp16', choices=['fp16', 'fp32'], help='Embedding precision (default: fp16)')
     parser.add_argument('--data-dir', type=str, default='./beir_datasets', help='Directory for BEIR datasets')
     parser.add_argument('--max-length', type=int, help="Max length of the texts")
+    parser.add_argument('--full-dim', action="store_true", help="Whether to store full dimension of the embedding or store truncated one")
     args = parser.parse_args()
 
     # Setup distributed training
@@ -265,19 +266,6 @@ def main():
     query_instruction = config.config.get('query_instruction', '')
     if is_main_process(rank):
         logger.info(f"Query instruction: {repr(query_instruction)}")
-
-    # Get output directory
-    output_dir = config.get_precomputed_embeddings_dir(dataset_names=[args.dataset], precision=args.precision)
-
-    if output_dir is None:
-        if is_main_process(rank):
-            logger.error("Error: 'precomputed_embeddings_dir' not found in config file")
-        cleanup_distributed()
-        return
-
-    if is_main_process(rank):
-        output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Output directory: {output_dir}")
 
     # Load teacher model (all ranks)
     if is_main_process(rank):
@@ -312,7 +300,7 @@ def main():
 
     # Determine target dimension
     use_projection = config.model['use_projection']
-    if use_projection:
+    if args.full_dim or use_projection:
         target_dim = embedding_dim
     else:
         target_dim = config.model['student_dim']
@@ -320,6 +308,19 @@ def main():
     if is_main_process(rank):
         logger.info(f"Teacher embedding dimension: {embedding_dim}")
         logger.info(f"Target dimension: {target_dim}")
+
+        # Get output directory
+    output_dir = config.get_precomputed_embeddings_dir(dataset_names=[args.dataset], precision=args.precision, dim=None if target_dim==embedding_dim else target_dim)
+
+    if output_dir is None:
+        if is_main_process(rank):
+            logger.error("Error: 'precomputed_embeddings_dir' not found in config file")
+        cleanup_distributed()
+        return
+
+    if is_main_process(rank):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
 
     # Load BEIR dataset (all ranks)
     corpus, queries = load_beir_dataset(args.dataset, args.data_dir)

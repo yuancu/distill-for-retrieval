@@ -27,13 +27,15 @@ class Phase1DatasetPrecomputed(Dataset):
         precomputed_embeddings_dir: Directory containing queries.mmap and corpus.mmap
         max_samples: Maximum number of samples (optional, truncates if set)
         data_dir: Directory for BEIR datasets (to load text samples)
+        dim: Required embedding dimension (truncates if different from target_dim in metadata)
     """
 
-    def __init__(self, dataset_name, precomputed_embeddings_dir, max_samples=None, data_dir='./beir_datasets'):
+    def __init__(self, dataset_name, precomputed_embeddings_dir, max_samples=None, data_dir='./beir_datasets', dim=None):
         self.dataset_name = dataset_name
         self.precomputed_embeddings_dir = Path(precomputed_embeddings_dir)
         self.max_samples = max_samples
         self.data_dir = data_dir
+        self.dim = dim
 
         # Load metadata
         metadata_path = self.precomputed_embeddings_dir / "metadata.json"
@@ -110,6 +112,12 @@ class Phase1DatasetPrecomputed(Dataset):
         if self.max_samples is not None and self.max_samples < self.embeddings.shape[0]:
             self.embeddings = self.embeddings[:self.max_samples]
 
+        # Truncate embedding dimension if dim is specified and different from target_dim
+        target_dim = self.metadata.get('target_dim', self.embeddings.shape[1])
+        if self.dim is not None and self.dim != target_dim:
+            logger.info(f"Truncating embeddings from {self.embeddings.shape[1]}d to {self.dim}d")
+            self.embeddings = self.embeddings[:, :self.dim]
+
         self.embedding_dim = self.embeddings.shape[1]
 
         bytes_per_elem = 2 if dtype_str == 'float16' else 4
@@ -142,15 +150,17 @@ class Phase2DatasetPrecomputed(Dataset):
         num_negatives: Number of hard negatives per query
         max_samples: Maximum number of query samples
         data_dir: Directory for BEIR datasets
+        dim: Required embedding dimension (truncates if different from target_dim in metadata)
     """
 
     def __init__(self, dataset_name, precomputed_embeddings_dir, num_negatives=7,
-                 max_samples=None, data_dir='./beir_datasets'):
+                 max_samples=None, data_dir='./beir_datasets', dim=None):
         self.dataset_name = dataset_name
         self.precomputed_embeddings_dir = Path(precomputed_embeddings_dir)
         self.num_negatives = num_negatives
         self.max_samples = max_samples
         self.data_dir = data_dir
+        self.dim = dim
 
         # Load metadata
         metadata_path = self.precomputed_embeddings_dir / "metadata.json"
@@ -248,15 +258,22 @@ class Phase2DatasetPrecomputed(Dataset):
         corpus_memmap = np.memmap(str(corpus_path), dtype=dtype_str, mode='r', shape=corpus_shape)
         self.corpus_embeddings = np.array(corpus_memmap)
 
-        self.embedding_dim = query_shape[1]
+        # Truncate embedding dimension if dim is specified and different from target_dim
+        target_dim = self.metadata.get('target_dim', query_shape[1])
+        if self.dim is not None and self.dim != target_dim:
+            logger.info(f"Truncating embeddings from {query_shape[1]}d to {self.dim}d")
+            self.query_embeddings = self.query_embeddings[:, :self.dim]
+            self.corpus_embeddings = self.corpus_embeddings[:, :self.dim]
+
+        self.embedding_dim = self.query_embeddings.shape[1]
 
         bytes_per_elem = 2 if dtype_str == 'float16' else 4
-        query_mb = (query_shape[0] * query_shape[1] * bytes_per_elem) / (1024 * 1024)
-        corpus_mb = (corpus_shape[0] * corpus_shape[1] * bytes_per_elem) / (1024 * 1024)
+        query_mb = (self.query_embeddings.shape[0] * self.query_embeddings.shape[1] * bytes_per_elem) / (1024 * 1024)
+        corpus_mb = (self.corpus_embeddings.shape[0] * self.corpus_embeddings.shape[1] * bytes_per_elem) / (1024 * 1024)
 
         logger.info(f"Loaded embeddings into RAM:")
-        logger.info(f"  Queries: {query_shape} ({query_mb:.2f} MB)")
-        logger.info(f"  Corpus: {corpus_shape} ({corpus_mb:.2f} MB)")
+        logger.info(f"  Queries: {self.query_embeddings.shape} ({query_mb:.2f} MB)")
+        logger.info(f"  Corpus: {self.corpus_embeddings.shape} ({corpus_mb:.2f} MB)")
 
     def __len__(self):
         return len(self.samples)

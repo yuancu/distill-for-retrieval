@@ -214,7 +214,8 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
             dataset_name=dataset_name,
             precomputed_embeddings_dir=precomputed_dir,
             max_samples=max_samples,
-            data_dir='./beir_datasets'
+            data_dir='./beir_datasets',
+            dim=target_dim
         )
         phase1_datasets.append(ds)
 
@@ -602,7 +603,8 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             precomputed_embeddings_dir=precomputed_dir,
             num_negatives=num_negatives,
             max_samples=max_samples,
-            data_dir='./beir_datasets'
+            data_dir='./beir_datasets',
+            dim=target_dim
         )
         phase2_datasets.append(ds)
 
