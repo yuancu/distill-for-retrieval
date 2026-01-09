@@ -382,6 +382,150 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
     return student_model
 
 
+def setup_router_trainer(student_model, config, device, rank, total_steps):
+    """Setup router and related components for joint training
+
+    Args:
+        student_model: Student model (possibly wrapped with DDP)
+        config: Training configuration
+        device: Device to use
+        rank: Process rank for distributed training
+        total_steps: Total training steps
+
+    Returns:
+        dict: Router trainer components (router, optimizer, loss_fn, weight_scheduler)
+    """
+    from .models import Router
+    from .losses import DifficultyLoss, RouterWeightScheduler
+
+    unwrapped_model = get_ddp_model(student_model)
+    student_dim = unwrapped_model.student_dim
+
+    # Initialize router
+    router = Router(student_dim=student_dim).to(device)
+
+    # Wrap with DDP if needed
+    if get_world_size() > 1:
+        router = torch.nn.parallel.DistributedDataParallel(
+            router, device_ids=[rank]
+        )
+
+    # Optimizer
+    router_optimizer = torch.optim.AdamW(
+        router.parameters(),
+        lr=config.get('router_lr', 1e-4),
+        weight_decay=0.01
+    )
+
+    # Loss function
+    router_loss_fn = DifficultyLoss(
+        infonce_weight=config['infonce_weight'],
+        mse_weight=config['mse_weight'],
+        temperature=config['temperature']
+    )
+
+    # Weight scheduler
+    weight_scheduler = RouterWeightScheduler(
+        target_weight=config.get('router_loss_weight', 0.1),
+        warmup_ratio=config.get('router_warmup_ratio', 0.3),
+        total_steps=total_steps
+    )
+
+    if is_main_process(rank):
+        logger.info("Router training enabled:")
+        logger.info(f"  - Target weight: {config.get('router_loss_weight', 0.1)}")
+        logger.info(f"  - Warmup ratio: {config.get('router_warmup_ratio', 0.3)}")
+        logger.info(f"  - Learning rate: {config.get('router_lr', 1e-4)}")
+
+    return {
+        'router': router,
+        'optimizer': router_optimizer,
+        'loss_fn': router_loss_fn,
+        'weight_scheduler': weight_scheduler,
+    }
+
+
+def train_router_step(
+    router_trainer,
+    student_model,
+    query_inputs,
+    student_query_emb,
+    teacher_query_emb,
+    student_doc_embs,
+    teacher_doc_embs,
+    global_step,
+    batch_idx,
+    config
+):
+    """Train router for one step
+
+    Args:
+        router_trainer: Dict with router components
+        student_model: Student model (possibly wrapped with DDP)
+        query_inputs: Tokenized query inputs
+        student_query_emb: Student query embeddings
+        teacher_query_emb: Teacher query embeddings
+        student_doc_embs: Student document embeddings
+        teacher_doc_embs: Teacher document embeddings
+        global_step: Current global step
+        batch_idx: Current batch index
+        config: Training configuration
+
+    Returns:
+        dict: Router training metrics
+    """
+    router = router_trainer['router']
+    optimizer = router_trainer['optimizer']
+    loss_fn = router_trainer['loss_fn']
+    weight_scheduler = router_trainer['weight_scheduler']
+
+    # Get current weight
+    current_global_step = global_step + (batch_idx + 1) // config['gradient_accumulation_steps']
+    router_weight = weight_scheduler.get_weight(current_global_step)
+
+    # Skip if weight is zero
+    if router_weight == 0:
+        return {'router_weight': 0.0}
+
+    # Get raw student embedding (768d)
+    # The forward() method returns (student_emb, output_emb)
+    # We need the first value which is always the base 768d embedding
+    unwrapped_model = get_ddp_model(student_model)
+
+    with torch.no_grad():
+        student_base_emb, _ = unwrapped_model(
+            query_inputs['input_ids'],
+            query_inputs['attention_mask'],
+            normalize=True
+        )
+
+    # Predict difficulty
+    pred_difficulty = router(student_base_emb.detach())
+
+    # Compute router loss
+    router_loss, router_metrics = loss_fn(
+        pred_difficulty,
+        student_query_emb.detach(),
+        teacher_query_emb.detach(),
+        student_doc_embs.detach(),
+        teacher_doc_embs.detach()
+    )
+
+    # Scale loss
+    scaled_loss = router_weight * router_loss / config['gradient_accumulation_steps']
+    scaled_loss.backward()
+
+    # Update optimizer (gradient accumulation aware)
+    if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
+        torch.nn.utils.clip_grad_norm_(router.parameters(), max_norm=1.0)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    # Return metrics
+    router_metrics['router_weight'] = router_weight
+    return router_metrics
+
+
 def train_phase2(student_model, teacher_model, config, device, checkpoint_path, rank=0):
     """Phase 2: Task-specific training with InfoNCE + MSE
 
@@ -527,8 +671,17 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
         temperature=config['temperature']
     )
 
+    # Optional router setup (only if enabled in config)
+    router_trainer = None
+    if config.get('train_router', False):
+        router_trainer = setup_router_trainer(
+            student_model, config, device, rank, total_steps
+        )
+
     # Training loop
     student_model.train()
+    if router_trainer is not None:
+        router_trainer['router'].train()
     best_loss = float('inf')
     global_step = 0
 
@@ -639,6 +792,22 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 teacher_doc_embs
             )
 
+            # Optional router training
+            if router_trainer is not None:
+                router_metrics = train_router_step(
+                    router_trainer,
+                    student_model,
+                    query_inputs,
+                    student_query_emb,
+                    teacher_query_emb,
+                    student_doc_embs,
+                    teacher_doc_embs,
+                    global_step,
+                    batch_idx,
+                    config
+                )
+                metrics.update(router_metrics)
+
             loss = loss / config['gradient_accumulation_steps']
             loss.backward()
 
@@ -669,12 +838,21 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
         # Save best model (only on rank 0, with barrier synchronization)
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_checkpoint_dist({
+            checkpoint_dict = {
                 'epoch': epoch,
                 'model_state_dict': get_ddp_model(student_model).state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, f"{checkpoint_path}.pt", rank)
+            }
+
+            # Add router state if training router
+            if router_trainer is not None:
+                checkpoint_dict['router_state_dict'] = \
+                    get_ddp_model(router_trainer['router']).state_dict()
+                checkpoint_dict['router_optimizer_state_dict'] = \
+                    router_trainer['optimizer'].state_dict()
+
+            save_checkpoint_dist(checkpoint_dict, f"{checkpoint_path}.pt", rank)
 
             if is_main_process(rank):
                 logger.info(f"Saved best Phase 2 model with loss: {best_loss:.4f}")
@@ -682,4 +860,7 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
     if is_main_process(rank):
         logger.info("\nPhase 2 training completed!")
 
+    # Return router if it was trained
+    if router_trainer is not None:
+        return student_model, router_trainer['router']
     return student_model

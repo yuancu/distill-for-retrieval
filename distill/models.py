@@ -124,3 +124,38 @@ class StudentModelWithProjection(nn.Module):
             return self.student_dim
         # Get projection output dimension
         return self.projection.layer2.out_features
+
+
+class Router(nn.Module):
+    """Routes queries to student or teacher model based on predicted difficulty
+
+    At inference time, uses only student embedding to predict if the query is
+    too difficult for the student model. If difficulty exceeds threshold,
+    routes to teacher model for better quality embeddings.
+
+    Architecture: 768d student embedding -> MLP -> difficulty score [0, 1]
+    """
+    def __init__(self, student_dim=768, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(student_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, student_query_emb):
+        """Predict difficulty score for routing decision
+
+        Args:
+            student_query_emb: (batch_size, student_dim) - ONLY student embeddings
+
+        Returns:
+            difficulty_scores: (batch_size,) - predicted difficulty in [0, 1]
+                              Higher score = more difficult = should route to teacher
+        """
+        return self.net(student_query_emb).squeeze(-1)

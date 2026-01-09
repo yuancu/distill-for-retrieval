@@ -126,3 +126,143 @@ class Phase2Loss(nn.Module):
             'query_mse': query_mse.item(),
             'doc_mse': doc_mse.item()
         }
+
+
+class DifficultyLoss(nn.Module):
+    """Computes difficulty labels and trains router to predict difficulty
+
+    Uses both InfoNCE and MSE losses to compute a continuous difficulty score
+    that represents how hard a sample is for the student model.
+    """
+    def __init__(self, infonce_weight=0.8, mse_weight=0.2, temperature=0.02):
+        super().__init__()
+        self.infonce_weight = infonce_weight
+        self.mse_weight = mse_weight
+        self.temperature = temperature
+
+    def compute_difficulty_labels(self, query_student, query_teacher, doc_student, doc_teacher):
+        """Compute per-sample difficulty scores from embeddings
+
+        Args:
+            query_student: (batch_size, dim) student query embeddings
+            query_teacher: (batch_size, dim) teacher query embeddings
+            doc_student: (batch_size, num_docs, dim) student doc embeddings
+            doc_teacher: (batch_size, num_docs, dim) teacher doc embeddings
+
+        Returns:
+            difficulty: (batch_size,) difficulty scores in [0, 1]
+            metrics: Dict with difficulty statistics
+        """
+        batch_size = query_student.shape[0]
+        num_docs = doc_student.shape[1]
+
+        with torch.no_grad():
+            # Compute per-sample InfoNCE loss (cross entropy without reduction)
+            student_sim = torch.matmul(
+                query_student.unsqueeze(1),
+                doc_student.transpose(1, 2)
+            ).squeeze(1) / self.temperature
+
+            labels = torch.zeros(batch_size, dtype=torch.long, device=query_student.device)
+            per_sample_infonce = F.cross_entropy(student_sim, labels, reduction='none')
+
+            # Compute per-sample MSE loss on query embeddings
+            per_sample_query_mse = ((query_student - query_teacher) ** 2).mean(dim=-1)
+
+            # Normalize InfoNCE loss to [0, 1]
+            # Max InfoNCE ≈ log(num_docs), so we normalize by this
+            max_infonce = torch.log(torch.tensor(float(num_docs), device=query_student.device))
+            normalized_infonce = torch.clamp(per_sample_infonce / max_infonce, 0, 1)
+
+            # Normalize MSE (for normalized embeddings, MSE ∈ [0, 4])
+            normalized_mse = torch.clamp(per_sample_query_mse / 4.0, 0, 1)
+
+            # Combined difficulty: weighted average
+            difficulty = (
+                self.infonce_weight * normalized_infonce +
+                self.mse_weight * normalized_mse
+            ) / (self.infonce_weight + self.mse_weight)
+
+            metrics = {
+                'avg_infonce_difficulty': normalized_infonce.mean().item(),
+                'avg_mse_difficulty': normalized_mse.mean().item(),
+                'avg_combined_difficulty': difficulty.mean().item(),
+            }
+
+        return difficulty, metrics
+
+    def forward(self, pred_difficulty, query_student, query_teacher, doc_student, doc_teacher):
+        """Compute loss between predicted and true difficulty
+
+        Args:
+            pred_difficulty: (batch_size,) predicted difficulty from router
+            query_student: (batch_size, dim) student query embeddings
+            query_teacher: (batch_size, dim) teacher query embeddings
+            doc_student: (batch_size, num_docs, dim) student doc embeddings
+            doc_teacher: (batch_size, num_docs, dim) teacher doc embeddings
+
+        Returns:
+            loss: MSE between predicted and true difficulty
+            metrics: Dict with difficulty metrics
+        """
+        # Compute true difficulty labels
+        true_difficulty, diff_metrics = self.compute_difficulty_labels(
+            query_student, query_teacher, doc_student, doc_teacher
+        )
+
+        # Regression loss (MSE)
+        loss = F.mse_loss(pred_difficulty, true_difficulty)
+
+        metrics = {
+            'router_loss': loss.item(),
+            'avg_true_difficulty': true_difficulty.mean().item(),
+            'avg_pred_difficulty': pred_difficulty.mean().item(),
+            **diff_metrics
+        }
+
+        return loss, metrics
+
+
+class RouterWeightScheduler:
+    """Adaptive weight scheduler for router loss
+
+    Schedule:
+    - Steps 0 to warmup_steps: weight = 0 (no router training)
+    - Steps warmup_steps to total_steps: linear ramp to target_weight
+    """
+    def __init__(self, target_weight=0.1, warmup_steps=None, total_steps=None, warmup_ratio=0.3):
+        """
+        Args:
+            target_weight: Final weight for router loss (e.g., 0.1)
+            warmup_steps: Steps before starting router training (optional)
+            total_steps: Total training steps (required)
+            warmup_ratio: If warmup_steps not provided, use this ratio of total_steps
+        """
+        if total_steps is None:
+            raise ValueError("total_steps must be provided")
+
+        self.target_weight = target_weight
+        self.total_steps = total_steps
+
+        if warmup_steps is None:
+            self.warmup_steps = int(total_steps * warmup_ratio)
+        else:
+            self.warmup_steps = warmup_steps
+
+    def get_weight(self, current_step):
+        """Get current weight for router loss
+
+        Args:
+            current_step: Current training step
+
+        Returns:
+            float: Weight for router loss in [0, target_weight]
+        """
+        if current_step < self.warmup_steps:
+            return 0.0
+
+        # Linear ramp from warmup_steps to total_steps
+        progress = (current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+        progress = min(progress, 1.0)  # Clamp to [0, 1]
+
+        return self.target_weight * progress

@@ -62,6 +62,12 @@ phase2:
   gradient_accumulation_steps: 8
   precomputed_embeddings_dir: "./cache/embedding/"
 
+  # Router configuration (opt-in)
+  train_router: false              # Set to true to enable router training
+  router_loss_weight: 0.1          # Target weight for router loss
+  router_warmup_ratio: 0.3         # Start router training after 30% of steps
+  router_lr: 1.0e-4                # Learning rate for router
+
 # Training control
 training:
   skip_phase1: true
