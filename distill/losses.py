@@ -6,14 +6,30 @@ import torch.nn.functional as F
 
 
 class Phase1Loss(nn.Module):
-    """Phase 1: MSE (0.4) + Cosine (0.6) on normalized embeddings"""
+    """Phase 1: MSE + Cosine loss on normalized embeddings
+
+    Note: For normalized embeddings, MSE and cosine are related:
+        ||a - b||² = 2(1 - cos(a, b)) when ||a|| = ||b|| = 1
+
+    Using both provides:
+    - MSE: Euclidean distance in embedding space
+    - Cosine: Direct angular/directional alignment
+
+    For retrieval models using cosine similarity at inference,
+    the cosine component is particularly important.
+    """
     def __init__(self, mse_weight=0.4, cosine_weight=0.6):
         super().__init__()
         self.mse_weight = mse_weight
         self.cosine_weight = cosine_weight
 
     def forward(self, student_emb, teacher_emb):
-        """Both embeddings should be normalized"""
+        """Both embeddings should be normalized
+
+        Args:
+            student_emb: (batch_size, dim) normalized student embeddings
+            teacher_emb: (batch_size, dim) normalized teacher embeddings
+        """
         # MSE loss on normalized embeddings
         mse_loss = F.mse_loss(student_emb, teacher_emb)
 
@@ -64,34 +80,34 @@ class Phase2Loss(nn.Module):
         ).squeeze(1) / self.temperature   # (batch_size, num_docs)
 
         # Debug: Print first batch statistics
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f"[DEBUG] student_sim shape: {student_sim.shape}, range: [{student_sim.min():.2f}, {student_sim.max():.2f}]")
-            print(f"[DEBUG] student_sim[0]: {student_sim[0]}")
-        elif not torch.distributed.is_initialized():
-            print(f"[DEBUG] student_sim shape: {student_sim.shape}, range: [{student_sim.min():.2f}, {student_sim.max():.2f}]")
-            print(f"[DEBUG] student_sim[0]: {student_sim[0]}")
+        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        #     print(f"[DEBUG] student_sim shape: {student_sim.shape}, range: [{student_sim.min():.2f}, {student_sim.max():.2f}]")
+        #     print(f"[DEBUG] student_sim[0]: {student_sim[0]}")
+        # elif not torch.distributed.is_initialized():
+        #     print(f"[DEBUG] student_sim shape: {student_sim.shape}, range: [{student_sim.min():.2f}, {student_sim.max():.2f}]")
+        #     print(f"[DEBUG] student_sim[0]: {student_sim[0]}")
 
         # Labels: first document is positive
         labels = torch.zeros(batch_size, dtype=torch.long, device=query_student.device)
 
         # Debug: Check softmax probabilities
-        probs = F.softmax(student_sim, dim=-1)
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f"[DEBUG] Softmax probs[0]: {probs[0]}")
-            print(f"[DEBUG] Prob of positive (should be high): {probs[0][0].item():.6f}")
-        elif not torch.distributed.is_initialized():
-            print(f"[DEBUG] Softmax probs[0]: {probs[0]}")
-            print(f"[DEBUG] Prob of positive (should be high): {probs[0][0].item():.6f}")
+        # probs = F.softmax(student_sim, dim=-1)
+        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        #     print(f"[DEBUG] Softmax probs[0]: {probs[0]}")
+        #     print(f"[DEBUG] Prob of positive (should be high): {probs[0][0].item():.6f}")
+        # elif not torch.distributed.is_initialized():
+        #     print(f"[DEBUG] Softmax probs[0]: {probs[0]}")
+        #     print(f"[DEBUG] Prob of positive (should be high): {probs[0][0].item():.6f}")
 
         infonce_loss = F.cross_entropy(student_sim, labels)
 
         # Debug: Print InfoNCE loss
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            print(f"[DEBUG] infonce_loss: {infonce_loss.item():.6f}")
-            print(f"[DEBUG] Expected loss if uniform: {torch.log(torch.tensor(float(num_docs))).item():.6f}")
-        elif not torch.distributed.is_initialized():
-            print(f"[DEBUG] infonce_loss: {infonce_loss.item():.6f}")
-            print(f"[DEBUG] Expected loss if uniform: {torch.log(torch.tensor(float(num_docs))).item():.6f}")
+        # if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        #     print(f"[DEBUG] infonce_loss: {infonce_loss.item():.6f}")
+        #     print(f"[DEBUG] Expected loss if uniform: {torch.log(torch.tensor(float(num_docs))).item():.6f}")
+        # elif not torch.distributed.is_initialized():
+        #     print(f"[DEBUG] infonce_loss: {infonce_loss.item():.6f}")
+        #     print(f"[DEBUG] Expected loss if uniform: {torch.log(torch.tensor(float(num_docs))).item():.6f}")
 
         # MSE loss on query embeddings
         query_mse = F.mse_loss(query_student, query_teacher)

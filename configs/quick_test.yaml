@@ -30,8 +30,10 @@ phase1:
   learning_rate: 2.0e-5
   warmup_steps: 100
   num_epochs: 1
-  mse_weight: 0.4
-  cosine_weight: 0.6
+  # For normalized embeddings, MSE and cosine are redundant: ||a-b||² = 2(1-cos(a,b))
+  # Using pure cosine loss is cleaner and matches what we optimize at inference
+  mse_weight: 0.0
+  cosine_weight: 1.0
   max_length: 512
   gradient_accumulation_steps: 4
 

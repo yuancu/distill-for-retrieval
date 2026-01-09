@@ -45,12 +45,12 @@ phase2:
   # Dataset configuration - can specify multiple datasets
   datasets:
     - name: "msmarco"
-      max_samples: 500000
+      max_samples: 10000000
     - name: "nfcorpus"
-      max_samples: 100000
+      max_samples: 1000000
 
   # Training hyperparameters
-  batch_size: 16
+  batch_size: 64
   learning_rate: 5.0e-6
   warmup_steps: 500
   num_epochs: 3
@@ -64,9 +64,9 @@ phase2:
 
 # Training control
 training:
-  skip_phase1: false
+  skip_phase1: true
   skip_phase2: false
-  save_to_artifacts: false
+  save_to_artifacts: true
 
 # Output paths
 paths:
