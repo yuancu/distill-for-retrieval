@@ -30,7 +30,7 @@ phase1:
       max_samples: 10000000
 
   # Training hyperparameters
-  batch_size: 64
+  batch_size: 16
   learning_rate: 2.0e-5
   warmup_steps: 1000
   num_epochs: 3
@@ -48,7 +48,7 @@ phase2:
       max_samples: 10000000
 
   # Training hyperparameters
-  batch_size: 64
+  batch_size: 16
   learning_rate: 5.0e-6
   warmup_steps: 500
   num_epochs: 4

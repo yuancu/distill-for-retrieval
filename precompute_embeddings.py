@@ -144,69 +144,89 @@ def encode_texts_sharded(teacher_model, texts, device, batch_size, dtype, rank, 
     return np.concatenate(all_embeddings, axis=0) if all_embeddings else np.zeros((0, all_embeddings[0].shape[1] if all_embeddings else 768), dtype=np.float16 if dtype == 'float16' else np.float32)
 
 
-def gather_embeddings_from_all_ranks(local_embeddings, rank, world_size):
-    """Gather embeddings from all ranks to rank 0."""
+def gather_embeddings_from_all_ranks(local_embeddings, rank, world_size, temp_dir_base=None):
+    """Gather embeddings from all ranks to rank 0 by saving to temporary files.
+
+    This approach completely avoids GPU memory for gathering:
+    1. Each rank saves its local embeddings to a temporary file
+    2. Synchronize to ensure all ranks finish saving
+    3. Rank 0 loads all temporary files and concatenates them
+    4. Clean up temporary files
+
+    Advantages:
+    - Zero GPU memory used (embeddings already on CPU as numpy arrays)
+    - Works with any distributed backend (NCCL, gloo)
+    - Can handle arbitrarily large embeddings
+
+    Args:
+        local_embeddings: numpy array of embeddings for this rank (already on CPU)
+        rank: current process rank
+        world_size: total number of processes
+        temp_dir_base: base directory for temporary files (default: /tmp)
+    """
     if world_size == 1:
         return local_embeddings
 
-    # Convert to torch tensor for gathering
-    local_tensor = torch.from_numpy(local_embeddings).cuda()
+    import shutil
+    import time
 
-    # Get sizes from all ranks
-    local_size = torch.tensor([local_tensor.shape[0]], dtype=torch.long, device='cuda')
-    size_list = [torch.zeros(1, dtype=torch.long, device='cuda') for _ in range(world_size)]
-    torch.distributed.all_gather(size_list, local_size)
+    # Generate a unique temporary directory ID on rank 0 and broadcast it
+    # (only broadcasts a single integer - minimal GPU memory)
+    if is_main_process(rank):
+        temp_id = int(time.time() * 1000000) % 1000000000  # microsecond timestamp
+        temp_id_tensor = torch.tensor([temp_id], dtype=torch.long, device='cuda')
+    else:
+        temp_id_tensor = torch.zeros(1, dtype=torch.long, device='cuda')
+
+    torch.distributed.broadcast(temp_id_tensor, src=0)
+    temp_id = temp_id_tensor.item()
+
+    # All ranks use the same temporary directory
+    if temp_dir_base is None:
+        temp_dir_base = "/tmp"
+    temp_dir = Path(temp_dir_base) / f"gather_embs_{temp_id}"
+
+    # Rank 0 creates the directory
+    if is_main_process(rank):
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created temporary directory: {temp_dir}")
+
+    # Wait for directory creation
+    torch.distributed.barrier()
+
+    # Each rank saves its embeddings to a .npy file (pure CPU/disk operation)
+    temp_file = temp_dir / f"rank_{rank}.npy"
+    np.save(str(temp_file), local_embeddings)
+    logger.info(f"Rank {rank} saved {local_embeddings.shape[0]} embeddings to {temp_file}")
+
+    # Synchronize to ensure all ranks finish saving
+    torch.distributed.barrier()
 
     if is_main_process(rank):
-        # Rank 0: prepare to receive from all ranks
-        size_list = [s.item() for s in size_list]
-        max_size = max(size_list) if size_list else 0
-        emb_dim = local_tensor.shape[1]
-
-        # Prepare padded tensors for gathering
-        gathered_list = []
-        for i in range(world_size):
-            gathered_list.append(torch.zeros(max_size, emb_dim, dtype=local_tensor.dtype, device='cuda'))
-    else:
-        gathered_list = None
-        size_list = None
-        max_size = None
-
-    # Broadcast max_size
-    if is_main_process(rank):
-        max_size_tensor = torch.tensor([max_size], dtype=torch.long, device='cuda')
-    else:
-        max_size_tensor = torch.zeros(1, dtype=torch.long, device='cuda')
-    torch.distributed.broadcast(max_size_tensor, src=0)
-    max_size = max_size_tensor.item()
-
-    # Pad local tensor to max_size
-    if local_tensor.shape[0] < max_size:
-        padding = torch.zeros(max_size - local_tensor.shape[0], local_tensor.shape[1], dtype=local_tensor.dtype, device='cuda')
-        local_tensor_padded = torch.cat([local_tensor, padding], dim=0)
-    else:
-        local_tensor_padded = local_tensor
-
-    # Gather all tensors at rank 0
-    if is_main_process(rank):
-        gathered_list[0] = local_tensor_padded
-        for i in range(1, world_size):
-            torch.distributed.recv(gathered_list[i], src=i)
-    else:
-        torch.distributed.send(local_tensor_padded, dst=0)
-
-    if is_main_process(rank):
-        # Concatenate and trim to actual sizes
+        # Rank 0: load all files and concatenate (pure CPU operation)
+        logger.info(f"Loading and concatenating embeddings from {world_size} ranks...")
         result_list = []
         for i in range(world_size):
-            actual_size = size_list[i]
-            if actual_size > 0:
-                result_list.append(gathered_list[i][:actual_size].cpu().numpy())
+            rank_file = temp_dir / f"rank_{i}.npy"
+            rank_embeddings = np.load(str(rank_file))
+            logger.info(f"  Loaded rank {i}: shape {rank_embeddings.shape}")
+            if rank_embeddings.shape[0] > 0:
+                result_list.append(rank_embeddings)
 
+        # Concatenate all embeddings
         if result_list:
-            return np.concatenate(result_list, axis=0)
+            result = np.concatenate(result_list, axis=0)
         else:
-            return np.zeros((0, emb_dim), dtype=local_embeddings.dtype)
+            emb_dim = local_embeddings.shape[1] if local_embeddings.shape[0] > 0 else 768
+            result = np.zeros((0, emb_dim), dtype=local_embeddings.dtype)
+
+        logger.info(f"Final concatenated shape: {result.shape}")
+
+        # Clean up temporary files and directory
+        shutil.rmtree(str(temp_dir))
+        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
+        return result
     else:
         return None
 
