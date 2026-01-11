@@ -48,7 +48,7 @@ phase2:
       max_samples: 10000000
 
   # Training hyperparameters
-  batch_size: 16
+  batch_size: 12
   learning_rate: 5.0e-6
   warmup_steps: 500
   num_epochs: 4
@@ -68,7 +68,7 @@ phase2:
 
 # Training control
 training:
-  skip_phase1: false
+  skip_phase1: true
   skip_phase2: false
   save_to_artifacts: true
 

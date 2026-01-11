@@ -245,16 +245,18 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             sampler=sampler,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
-            pin_memory=True
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True  # Keep workers alive between epochs
         )
     else:
         dataloader = DataLoader(
             dataset,
             batch_size=config['batch_size'],
             shuffle=True,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
-            pin_memory=True
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True  # Keep workers alive between epochs
         )
 
 
@@ -281,6 +283,11 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         mse_weight=config['mse_weight'],
         cosine_weight=config['cosine_weight']
     )
+
+    # Mixed precision training
+    scaler = torch.amp.GradScaler('cuda')
+    if is_main_process(rank):
+        logger.info("Using mixed precision training (fp16)")
 
     # Training loop
     student_model.train()
@@ -322,28 +329,32 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
 
             # Get teacher embeddings from pre-computed cache
             with torch.no_grad():
-                # Load pre-computed embeddings from RAM to GPU
-                teacher_emb_np = np.array([dataset.get_embedding(idx) for idx in indices])
-                teacher_emb = torch.from_numpy(teacher_emb_np).to(device, dtype=torch.float32)
+                # Load pre-computed embeddings from RAM to GPU using vectorized indexing
+                teacher_emb = torch.from_numpy(dataset.embeddings[indices]).to(device, dtype=torch.float32)
 
-            # Encode with student using forward() for proper gradient flow
-            _, student_emb = student_model(
-                text_inputs['input_ids'],
-                text_inputs['attention_mask'],
-                normalize=True
-            )
+            # Mixed precision forward pass and loss computation
+            with torch.amp.autocast('cuda'):
+                # Encode with student using forward() for proper gradient flow
+                _, student_emb = student_model(
+                    text_inputs['input_ids'],
+                    text_inputs['attention_mask'],
+                    normalize=True
+                )
 
-            # Compute loss
-            loss, metrics = criterion(student_emb, teacher_emb)
+                # Compute loss
+                loss, metrics = criterion(student_emb, teacher_emb)
+                loss = loss / config['gradient_accumulation_steps']
 
-            loss = loss / config['gradient_accumulation_steps']
-            loss.backward()
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
-                # Gradient clipping
+                # Gradient clipping with scaler
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=1.0)
 
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -634,18 +645,20 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             dataset,
             batch_size=config['batch_size'],
             sampler=sampler,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
+            num_workers=4,
             collate_fn=phase2_collate_fn,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True  # Keep workers alive between epochs
         )
     else:
         dataloader = DataLoader(
             dataset,
             batch_size=config['batch_size'],
             shuffle=True,
-            num_workers=0,  # Set to 0 to avoid multiprocessing issues with BEIR dataset loading
+            num_workers=4,
             collate_fn=phase2_collate_fn,
-            pin_memory=True
+            pin_memory=True,
+            persistent_workers=True  # Keep workers alive between epochs
         )
 
     # Setup optimizer with lower learning rate
@@ -672,6 +685,11 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
         mse_weight=config['mse_weight'],
         temperature=config['temperature']
     )
+
+    # Mixed precision training
+    scaler = torch.amp.GradScaler('cuda')
+    if is_main_process(rank):
+        logger.info("Using mixed precision training (fp16)")
 
     # Optional router setup (only if enabled in config)
     router_trainer = None
@@ -730,17 +748,19 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 return_tensors='pt'
             ).to(device)
 
-            # Get teacher query embeddings from pre-computed cache
+            # Get teacher query embeddings from pre-computed cache using vectorized indexing
             with torch.no_grad():
-                teacher_query_emb_np = np.array([dataset.get_query_embedding(idx) for idx in query_indices])
-                teacher_query_emb = torch.from_numpy(teacher_query_emb_np).to(device, dtype=torch.float32)
+                # Use vectorized numpy indexing to load all query embeddings at once
+                teacher_query_emb = torch.from_numpy(dataset.query_embeddings[query_indices]).to(device, dtype=torch.float32)
 
-            # Encode queries with student using forward()
-            _, student_query_emb = student_model(
-                query_inputs['input_ids'],
-                query_inputs['attention_mask'],
-                normalize=True
-            )
+            # Mixed precision forward pass for queries
+            with torch.amp.autocast('cuda'):
+                # Encode queries with student using forward()
+                _, student_query_emb = student_model(
+                    query_inputs['input_ids'],
+                    query_inputs['attention_mask'],
+                    normalize=True
+                )
 
             # Encode documents
             teacher_doc_embs = []
@@ -756,24 +776,28 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                     return_tensors='pt'
                 ).to(device)
 
-                # Get teacher doc embeddings from pre-computed cache
+                # Get teacher doc embeddings from pre-computed cache using vectorized indexing
                 with torch.no_grad():
                     # Load pre-computed embeddings: positive + negatives
-                    sample_idx = query_indices[i]  # Use query index to lookup sample
-                    pos_emb = dataset.get_positive_embedding(sample_idx)
-                    neg_embs = dataset.get_negative_embeddings(sample_idx)
+                    pos_idx = pos_indices[i]
+                    neg_idx_list = neg_indices_list[i]
+
+                    # Use vectorized indexing for positive and negatives
+                    pos_emb = dataset.corpus_embeddings[pos_idx:pos_idx+1]  # Keep 2D shape
+                    neg_embs = dataset.corpus_embeddings[neg_idx_list]
 
                     # Combine: [positive, negative1, negative2, ...]
-                    doc_embs_np = np.vstack([pos_emb[np.newaxis, :], neg_embs])
+                    doc_embs_np = np.vstack([pos_emb, neg_embs])
                     teacher_docs = torch.from_numpy(doc_embs_np).to(device, dtype=torch.float32)
                     teacher_doc_embs.append(teacher_docs)
 
-                # Encode with student using forward()
-                _, student_docs = student_model(
-                    doc_inputs['input_ids'],
-                    doc_inputs['attention_mask'],
-                    normalize=True
-                )
+                # Encode with student using forward() with mixed precision
+                with torch.amp.autocast('cuda'):
+                    _, student_docs = student_model(
+                        doc_inputs['input_ids'],
+                        doc_inputs['attention_mask'],
+                        normalize=True
+                    )
                 student_doc_embs.append(student_docs)
 
             # Stack to (batch_size, num_docs, dim)
@@ -786,13 +810,14 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 logger.info(f"[DEBUG] student_doc_embs shape: {student_doc_embs.shape}")
                 logger.info(f"[DEBUG] batch_size: {batch_size}, num_docs per query: {student_doc_embs.shape[1]}")
 
-            # Compute loss
-            loss, metrics = criterion(
-                student_query_emb,
-                teacher_query_emb,
-                student_doc_embs,
-                teacher_doc_embs
-            )
+            # Compute loss with mixed precision
+            with torch.amp.autocast('cuda'):
+                loss, metrics = criterion(
+                    student_query_emb,
+                    teacher_query_emb,
+                    student_doc_embs,
+                    teacher_doc_embs
+                )
 
             # Optional router training
             if router_trainer is not None:
@@ -811,11 +836,15 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 metrics.update(router_metrics)
 
             loss = loss / config['gradient_accumulation_steps']
-            loss.backward()
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
+                # Gradient clipping with scaler
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=1.0)
-                optimizer.step()
+
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
