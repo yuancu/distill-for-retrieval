@@ -1,6 +1,6 @@
 """Distillation module for retrieval model distillation."""
 
-from .models import ProjectionLayer, StudentModelWithProjection
+from .models import ProjectionLayer, StudentModelWithProjection, Router
 from .losses import Phase1Loss, Phase2Loss
 from .datasets import Phase1DatasetPrecomputed, Phase2DatasetPrecomputed
 from .train import train_phase1, train_phase2, phase2_collate_fn
@@ -20,6 +20,7 @@ from .config import TrainingConfig, load_config, list_available_configs
 __all__ = [
     'ProjectionLayer',
     'StudentModelWithProjection',
+    'Router',
     'Phase1Loss',
     'Phase2Loss',
     'Phase1DatasetPrecomputed',

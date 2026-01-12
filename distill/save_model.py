@@ -268,6 +268,11 @@ def save_distilled_model_to_artifacts(
     student_model.eval()
     print("   ✓ Checkpoint loaded successfully")
 
+    # Check if router is present in checkpoint
+    has_router = 'router_state_dict' in checkpoint
+    if has_router:
+        print("   ✓ Router detected in checkpoint")
+
     # Determine mode and output dimension
     use_projection = student_model.use_projection
     output_dim = student_model.get_output_dim()
@@ -321,8 +326,18 @@ def save_distilled_model_to_artifacts(
     model.save(output_path)
     print("   ✓ Model saved successfully")
 
+    # Save router if present in checkpoint
+    if has_router:
+        print("\n6. Saving router...")
+        router_state_dict = _remove_ddp_and_compile_prefixes(checkpoint['router_state_dict'])
+        save_router_model(
+            router_state_dict=router_state_dict,
+            output_path=output_path,
+            student_dim=student_model.student_dim
+        )
+
     # Save additional metadata
-    print("\n6. Saving metadata...")
+    print(f"\n{'7' if has_router else '6'}. Saving metadata...")
 
     # Build metadata based on mode
     metadata = {
@@ -332,6 +347,7 @@ def save_distilled_model_to_artifacts(
         "embedding_dimension": output_dim,
         "base_dimension": student_model.student_dim,
         "distillation_mode": "projection" if use_projection else "mrl",
+        "router": has_router,
         "usage": "model = SentenceTransformer('{}')".format(output_path)
     }
 
@@ -352,7 +368,7 @@ def save_distilled_model_to_artifacts(
     print("   ✓ Metadata saved")
 
     # Test the saved model
-    print("\n7. Testing saved model...")
+    print(f"\n{'8' if has_router else '7'}. Testing saved model...")
     loaded_model = SentenceTransformer(output_path)
     test_texts = ["This is a test sentence."]
     embeddings = loaded_model.encode(test_texts, convert_to_tensor=True)
@@ -388,6 +404,98 @@ def save_distilled_model_to_artifacts(
         print(f"It's trained to match the teacher's first {output_dim} dimensions.")
 
     return output_path
+
+
+def save_router_model(
+    router_state_dict: Dict[str, Any],
+    output_path: str,
+    student_dim: int
+):
+    """Save router model weights from checkpoint state dict
+
+    Args:
+        router_state_dict: Router state dict from checkpoint
+        output_path: Base artifacts directory where model is being saved (e.g., ./artifacts/model-name)
+        student_dim: Student model dimension (needed for usage instructions)
+    """
+    # Save router model using safetensors
+    router_model_path = os.path.join(output_path, "router.safetensors")
+
+    try:
+        from safetensors.torch import save_file
+        save_file(router_state_dict, router_model_path)
+        print(f"   ✓ Router model saved to: router.safetensors")
+    except ImportError:
+        # Fallback to PyTorch if safetensors not available
+        router_model_path = os.path.join(output_path, "router.pt")
+        torch.save(router_state_dict, router_model_path)
+        print(f"   ✓ Router model saved to: router.pt (safetensors not available)")
+
+    # Extract router architecture info from state dict
+    # Router architecture: Linear(student_dim, hidden_dim) -> ... -> Linear(hidden_dim//2, 1)
+    first_layer_weight = router_state_dict.get('net.0.weight', router_state_dict.get('0.weight'))
+    if first_layer_weight is not None:
+        hidden_dim = first_layer_weight.shape[0]
+
+        print(f"""
+   Router: {student_dim}d → {hidden_dim}d → 1 (difficulty score)
+
+   To use the router for inference:
+   ```python
+   import torch
+   from distill import Router
+   from safetensors.torch import load_file
+
+   # Create and load router
+   router = Router(student_dim={student_dim}, hidden_dim={hidden_dim})
+   state_dict = load_file('{router_model_path}')
+   router.load_state_dict(state_dict)
+   router.eval()
+
+   # Use for routing
+   with torch.no_grad():
+       difficulty = router(student_query_embeddings)  # Shape: (batch_size,)
+       use_teacher = difficulty > 0.5  # Route to teacher if difficult
+   ```
+""")
+
+    return router_model_path
+
+
+def load_router_model(output_path: str, student_dim: int, hidden_dim: int = 256, device='cpu'):
+    """Load router model from saved artifacts
+
+    Args:
+        output_path: Base artifacts directory where model was saved (e.g., ./artifacts/model-name)
+        student_dim: Student model dimension (e.g., 768)
+        hidden_dim: Router hidden dimension (default: 256)
+        device: Device to load model on
+
+    Returns:
+        Router model
+    """
+    from distill import Router
+
+    # Create router
+    router = Router(
+        student_dim=student_dim,
+        hidden_dim=hidden_dim
+    ).to(device)
+
+    # Load weights
+    router_model_path = os.path.join(output_path, "router.safetensors")
+    if os.path.exists(router_model_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(router_model_path, device=str(device))
+    else:
+        # Fallback to .pt file
+        router_model_path = os.path.join(output_path, "router.pt")
+        state_dict = torch.load(router_model_path, map_location=device)
+
+    router.load_state_dict(state_dict)
+    router.eval()
+
+    return router
 
 
 if __name__ == "__main__":
