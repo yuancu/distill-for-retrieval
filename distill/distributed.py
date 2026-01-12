@@ -123,14 +123,20 @@ def wrap_model_ddp(model, device, local_rank):
 
 
 def get_ddp_model(model):
-    """Get the underlying model from DDP wrapper.
+    """Get the underlying model from DDP and torch.compile wrappers.
 
     Args:
-        model: Model (possibly wrapped with DDP)
+        model: Model (possibly wrapped with DDP and/or torch.compile)
 
     Returns:
-        Underlying model without DDP wrapper
+        Underlying model without DDP or torch.compile wrappers
     """
+    # Unwrap torch.compile if present (checks for _orig_mod attribute)
+    if hasattr(model, '_orig_mod'):
+        model = model._orig_mod
+
+    # Unwrap DDP if present
     if isinstance(model, DDP):
         return model.module
+
     return model

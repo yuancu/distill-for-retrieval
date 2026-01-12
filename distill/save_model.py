@@ -204,6 +204,29 @@ class ProjectionModule(nn.Module):
     print(f"   ✓ Saved self-contained model.py to {model_py_path}")
 
 
+def _remove_ddp_and_compile_prefixes(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove DDP (_orig_mod., module.) prefixes from state dict keys.
+
+    Handles state dicts saved from models that were:
+    - Wrapped with DDP (adds 'module.' prefix)
+    - Compiled with torch.compile() (adds '_orig_mod.' prefix)
+
+    Args:
+        state_dict: State dict with possible prefixes
+
+    Returns:
+        State dict with prefixes removed
+    """
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        # Remove _orig_mod. prefix (from torch.compile)
+        new_key = key.replace('_orig_mod.', '')
+        # Remove module. prefix (from DDP)
+        new_key = new_key.replace('module.', '')
+        new_state_dict[new_key] = value
+    return new_state_dict
+
+
 def save_distilled_model_to_artifacts(
     student_model: StudentModelWithProjection,
     checkpoint_path: str,
@@ -238,7 +261,10 @@ def save_distilled_model_to_artifacts(
     # Load the best checkpoint
     print(f"\n1. Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, weights_only=False)
-    student_model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Remove DDP and torch.compile prefixes from state dict
+    state_dict = _remove_ddp_and_compile_prefixes(checkpoint['model_state_dict'])
+    student_model.load_state_dict(state_dict)
     student_model.eval()
     print("   ✓ Checkpoint loaded successfully")
 
@@ -251,7 +277,7 @@ def save_distilled_model_to_artifacts(
 
     # Auto-generate model name if not provided
     if model_name is None:
-        model_name = f"distilled-mpnet-{output_dim}d"
+        model_name = f"distilled-{output_dim}d"
         if not use_projection:
             model_name += "-mrl"
 

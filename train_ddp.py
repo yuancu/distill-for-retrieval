@@ -31,6 +31,7 @@ from distill import (
     cleanup_distributed,
     wrap_model_ddp,
     get_rank,
+    get_world_size,
     is_main_process,
     TrainingConfig,
     load_config,
@@ -239,7 +240,7 @@ def main():
             logger.info("Starting Phase 2 training...")
             logger.info("=" * 80)
 
-        student_model = train_phase2(
+        result = train_phase2(
             student_model,
             teacher_model,
             config.phase2,
@@ -248,11 +249,23 @@ def main():
             rank=rank
         )
 
+        # Unpack result - train_phase2 returns (model, router) if router training is enabled
+        if isinstance(result, tuple):
+            student_model, router = result
+            if is_main_process(rank):
+                logger.info("Router training was enabled and completed")
+        else:
+            student_model = result
+
         if is_main_process(rank):
             logger.info(f"Phase 2 complete. Checkpoint saved to: {phase2_checkpoint}.pt")
     else:
         if is_main_process(rank):
             logger.info("Skipping Phase 2 (skip_phase2=true in config)")
+
+    # Synchronize all ranks before saving (prevents timeout during artifact saving)
+    if get_world_size() > 1:
+        torch.distributed.barrier()
 
     # Save to artifacts (only on rank 0)
     if config.training['save_to_artifacts'] and is_main_process(rank):
@@ -268,7 +281,7 @@ def main():
             final_checkpoint = f"{phase1_checkpoint}.pt"
             logger.info(f"Using Phase 1 checkpoint: {final_checkpoint}")
         else:
-            logger.warning("No training was performed, skipping model saving")
+            logger.warning("No training was performed, skip saving artifacts")
             final_checkpoint = None
 
         if final_checkpoint and os.path.exists(final_checkpoint):
@@ -295,6 +308,10 @@ def main():
                 logger.error(f"Failed to save model: {e}")
         elif final_checkpoint:
             logger.warning(f"Checkpoint not found: {final_checkpoint}")
+
+    # Synchronize all ranks after saving (ensures rank 0 finishes before cleanup)
+    if get_world_size() > 1:
+        torch.distributed.barrier()
 
     # Cleanup
     cleanup_distributed()

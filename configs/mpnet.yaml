@@ -1,5 +1,5 @@
-# Qwen as student model distillation configuration (no projection)
-# This config uses direct distillation from teacher's first 1024d to student
+# MRL-based distillation configuration (no projection)
+# This config uses direct distillation from teacher's first 768d to student
 
 # Query instruction for retrieval
 query_instruction: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
@@ -13,9 +13,9 @@ precomputed_embeddings_dir: "./cache/embedding/"
 # Model configuration
 model:
   teacher: "infly/inf-retriever-v1"
-  student: "Qwen/Qwen3-Embedding-0.6B"
+  student: "sentence-transformers/all-mpnet-base-v2"
   teacher_dim: 3584
-  student_dim: 1024
+  student_dim: 768
   projection_hidden_dim: 1536  # Not used when use_projection=false
   # Distillation mode: MRL-based (no projection)
   use_projection: false
@@ -30,10 +30,10 @@ phase1:
       max_samples: 10000000
 
   # Training hyperparameters
-  batch_size: 16
+  batch_size: 64
   learning_rate: 2.0e-5
   warmup_steps: 1000
-  num_epochs: 2
+  num_epochs: 3
   mse_weight: 1
   cosine_weight: 0
   max_length: 512
@@ -48,10 +48,10 @@ phase2:
       max_samples: 10000000
 
   # Training hyperparameters
-  batch_size: 8
-  learning_rate: 2.5e-6
-  warmup_steps: 300
-  num_epochs: 2
+  batch_size: 16
+  learning_rate: 5.0e-6
+  warmup_steps: 500
+  num_epochs: 3
   infonce_weight: 0.8
   mse_weight: 0.2
   temperature: 0.02
@@ -61,7 +61,7 @@ phase2:
   precomputed_embeddings_dir: "./cache/embedding/"
 
   # Router configuration (opt-in)
-  train_router: false              # Set to true to enable router training
+  train_router: true              # Set to true to enable router training
   router_loss_weight: 0.1          # Target weight for router loss
   router_warmup_ratio: 0.3         # Start router training after 30% of steps
   router_lr: 1.0e-4                # Learning rate for router
@@ -69,7 +69,7 @@ phase2:
 # Training control
 training:
   skip_phase1: true
-  skip_phase2: false
+  skip_phase2: true
   save_to_artifacts: true
 
 # Output paths

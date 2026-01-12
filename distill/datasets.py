@@ -246,12 +246,12 @@ class Phase2DatasetPrecomputed(Dataset):
         """Load pre-computed embeddings into RAM."""
         dtype_str = self.metadata.get('dtype', 'float16')
 
+        logger.info("Loading query and corpus embeddings...")
         # Load queries
         query_shape = tuple(self.metadata['query_embeddings_shape'])
         query_path = self.precomputed_embeddings_dir / "queries.mmap"
         query_memmap = np.memmap(str(query_path), dtype=dtype_str, mode='r', shape=query_shape)
         self.query_embeddings = np.array(query_memmap)
-
         # Load corpus
         corpus_shape = tuple(self.metadata['corpus_embeddings_shape'])
         corpus_path = self.precomputed_embeddings_dir / "corpus.mmap"

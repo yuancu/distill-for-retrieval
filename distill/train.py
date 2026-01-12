@@ -20,6 +20,54 @@ from .distributed import (
 logger = logging.getLogger(__name__)
 
 
+def setup_performance_optimizations(model, config, rank=0):
+    """Setup hardware optimizations and model compilation for maximum performance.
+
+    Args:
+        model: Model to optimize
+        config: Training configuration
+        rank: Process rank for distributed training
+
+    Returns:
+        Optimized model
+    """
+    # Enable hardware-specific optimizations for Ampere+ GPUs (A100, H100, RTX 30xx/40xx)
+    if torch.cuda.is_available():
+        # Enable TF32 for faster matmul on Ampere+ (slight precision loss, big speedup)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Enable cuDNN autotuner (finds fastest convolution algorithms)
+        # Only safe if input sizes are consistent
+        torch.backends.cudnn.benchmark = True
+
+        if is_main_process(rank):
+            logger.info("Enabled hardware optimizations:")
+            logger.info("  - TF32 for matmul and cuDNN")
+            logger.info("  - cuDNN autotuner")
+
+    # Compile model with torch.compile() for 30-200% speedup (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and config.get('use_torch_compile', True):
+        compile_mode = config.get('torch_compile_mode', 'default')
+
+        if is_main_process(rank):
+            logger.info(f"Compiling model with torch.compile() (mode: {compile_mode})")
+            logger.info("  This may take 30-60 seconds on first batch...")
+
+        # Compile the model
+        # Note: For DDP models, compile the underlying model, not the DDP wrapper
+        try:
+            model = torch.compile(model, mode=compile_mode)
+            if is_main_process(rank):
+                logger.info("  Model compilation successful!")
+        except Exception as e:
+            if is_main_process(rank):
+                logger.warning(f"  torch.compile() failed: {e}")
+                logger.warning("  Continuing without compilation (will be slower)")
+
+    return model
+
+
 class MultiDatasetWrapper:
     """Wrapper for multiple Phase1/Phase2 datasets that supports get_embedding methods."""
 
@@ -171,6 +219,9 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         if get_world_size() > 1:
             logger.info(f"Distributed training on {get_world_size()} GPUs")
 
+    # Setup performance optimizations (TF32, cuDNN, torch.compile)
+    student_model = setup_performance_optimizations(student_model, config, rank)
+
     # Get tokenizer from student model
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
@@ -260,11 +311,12 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         )
 
 
-    # Setup optimizer
+    # Setup optimizer with fused operations for 10-20% speedup (requires PyTorch >= 2.0)
     optimizer = torch.optim.AdamW(
         student_model.parameters(),
         lr=config['learning_rate'],
-        weight_decay=0.01
+        weight_decay=0.01,
+        fused=True
     )
 
     # Learning rate scheduler with warmup
@@ -284,10 +336,10 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
         cosine_weight=config['cosine_weight']
     )
 
-    # Mixed precision training
-    scaler = torch.amp.GradScaler('cuda')
+    # Mixed precision training with bfloat16 (no gradient scaling needed)
+    # Note: bfloat16 has the same range as float32, so no GradScaler required
     if is_main_process(rank):
-        logger.info("Using mixed precision training (fp16)")
+        logger.info("Using mixed precision training (bfloat16, no gradient scaling)")
 
     # Training loop
     student_model.train()
@@ -330,10 +382,10 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
             # Get teacher embeddings from pre-computed cache
             with torch.no_grad():
                 # Load pre-computed embeddings from RAM to GPU using vectorized indexing
-                teacher_emb = torch.from_numpy(dataset.embeddings[indices]).to(device, dtype=torch.float32)
+                teacher_emb = torch.from_numpy(dataset.embeddings[indices]).to(device)
 
             # Mixed precision forward pass and loss computation
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # Encode with student using forward() for proper gradient flow
                 _, student_emb = student_model(
                     text_inputs['input_ids'],
@@ -345,16 +397,14 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
                 loss, metrics = criterion(student_emb, teacher_emb)
                 loss = loss / config['gradient_accumulation_steps']
 
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+            # Backward pass (no scaling needed with bfloat16)
+            loss.backward()
 
             if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
-                # Gradient clipping with scaler
-                scaler.unscale_(optimizer)
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=1.0)
 
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -387,6 +437,12 @@ def train_phase1(student_model, teacher_model, config, device, checkpoint_path, 
 
             if is_main_process(rank):
                 logger.info(f"Saved best Phase 1 model with loss: {best_loss:.4f}")
+
+    # Synchronize all ranks before completing (important for compiled models and DDP)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if get_world_size() > 1:
+        torch.distributed.barrier()
 
     if is_main_process(rank):
         logger.info("\nPhase 1 training completed!")
@@ -422,11 +478,12 @@ def setup_router_trainer(student_model, config, device, rank, total_steps):
             router, device_ids=[rank]
         )
 
-    # Optimizer
+    # Optimizer with fused operations for 10-20% speedup
     router_optimizer = torch.optim.AdamW(
         router.parameters(),
         lr=config.get('router_lr', 1e-4),
-        weight_decay=0.01
+        weight_decay=0.01,
+        fused=True
     )
 
     # Loss function
@@ -570,6 +627,9 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
         if get_world_size() > 1:
             logger.info(f"Distributed training on {get_world_size()} GPUs")
 
+    # Setup performance optimizations (TF32, cuDNN, torch.compile)
+    student_model = setup_performance_optimizations(student_model, config, rank)
+
     # Get tokenizer from student model
     tokenizer = unwrapped_model.student.tokenizer
     max_length = config.get('max_length', 512)
@@ -661,11 +721,12 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             persistent_workers=True  # Keep workers alive between epochs
         )
 
-    # Setup optimizer with lower learning rate
+    # Setup optimizer with fused operations for 10-20% speedup (requires PyTorch >= 2.0)
     optimizer = torch.optim.AdamW(
         student_model.parameters(),
         lr=config['learning_rate'],
-        weight_decay=0.01
+        weight_decay=0.01,
+        fused=True
     )
 
     # Learning rate scheduler
@@ -686,10 +747,10 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
         temperature=config['temperature']
     )
 
-    # Mixed precision training
-    scaler = torch.amp.GradScaler('cuda')
+    # Mixed precision training with bfloat16 (no gradient scaling needed)
+    # Note: bfloat16 has the same range as float32, so no GradScaler required
     if is_main_process(rank):
-        logger.info("Using mixed precision training (fp16)")
+        logger.info("Using mixed precision training (bfloat16, no gradient scaling)")
 
     # Optional router setup (only if enabled in config)
     router_trainer = None
@@ -751,10 +812,10 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
             # Get teacher query embeddings from pre-computed cache using vectorized indexing
             with torch.no_grad():
                 # Use vectorized numpy indexing to load all query embeddings at once
-                teacher_query_emb = torch.from_numpy(dataset.query_embeddings[query_indices]).to(device, dtype=torch.float32)
+                teacher_query_emb = torch.from_numpy(dataset.query_embeddings[query_indices]).to(device)
 
             # Mixed precision forward pass for queries
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 # Encode queries with student using forward()
                 _, student_query_emb = student_model(
                     query_inputs['input_ids'],
@@ -762,47 +823,46 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                     normalize=True
                 )
 
-            # Encode documents
-            teacher_doc_embs = []
-            student_doc_embs = []
+            # Encode documents - OPTIMIZED: Batch all documents together
+            # Flatten all documents into a single list for parallel encoding
+            num_docs_per_query = len(all_docs[0])  # All queries have same number of docs (padded)
+            flat_docs = [doc for docs in all_docs for doc in docs]  # Flatten to single list
 
-            for i, docs in enumerate(all_docs):
-                # Tokenize documents
-                doc_inputs = tokenizer(
-                    docs,
-                    padding=True,
-                    truncation=True,
-                    max_length=max_length,
-                    return_tensors='pt'
-                ).to(device)
+            # Tokenize all documents at once (much faster than per-query)
+            doc_inputs = tokenizer(
+                flat_docs,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            ).to(device)
 
-                # Get teacher doc embeddings from pre-computed cache using vectorized indexing
-                with torch.no_grad():
-                    # Load pre-computed embeddings: positive + negatives
+            # Get teacher doc embeddings - vectorized for all documents at once
+            with torch.no_grad():
+                # Flatten all document indices: [pos0, neg0_1, neg0_2, ..., pos1, neg1_1, ...]
+                flat_doc_indices = []
+                for i in range(batch_size):
                     pos_idx = pos_indices[i]
                     neg_idx_list = neg_indices_list[i]
+                    flat_doc_indices.append(pos_idx)
+                    flat_doc_indices.extend(neg_idx_list)
 
-                    # Use vectorized indexing for positive and negatives
-                    pos_emb = dataset.corpus_embeddings[pos_idx:pos_idx+1]  # Keep 2D shape
-                    neg_embs = dataset.corpus_embeddings[neg_idx_list]
+                # Load all embeddings at once using vectorized indexing
+                teacher_doc_embs_flat = torch.from_numpy(
+                    dataset.corpus_embeddings[flat_doc_indices]
+                ).to(device)
 
-                    # Combine: [positive, negative1, negative2, ...]
-                    doc_embs_np = np.vstack([pos_emb, neg_embs])
-                    teacher_docs = torch.from_numpy(doc_embs_np).to(device, dtype=torch.float32)
-                    teacher_doc_embs.append(teacher_docs)
+            # Encode all documents with student in a single forward pass (MAJOR SPEEDUP)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                _, student_doc_embs_flat = student_model(
+                    doc_inputs['input_ids'],
+                    doc_inputs['attention_mask'],
+                    normalize=True
+                )
 
-                # Encode with student using forward() with mixed precision
-                with torch.amp.autocast('cuda'):
-                    _, student_docs = student_model(
-                        doc_inputs['input_ids'],
-                        doc_inputs['attention_mask'],
-                        normalize=True
-                    )
-                student_doc_embs.append(student_docs)
-
-            # Stack to (batch_size, num_docs, dim)
-            teacher_doc_embs = torch.stack(teacher_doc_embs)
-            student_doc_embs = torch.stack(student_doc_embs)
+            # Reshape back to (batch_size, num_docs, dim)
+            teacher_doc_embs = teacher_doc_embs_flat.view(batch_size, num_docs_per_query, -1)
+            student_doc_embs = student_doc_embs_flat.view(batch_size, num_docs_per_query, -1)
 
             # Debug: Check shapes before passing to loss (only once per epoch)
             if batch_idx == 0 and is_main_process(rank):
@@ -811,7 +871,7 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 logger.info(f"[DEBUG] batch_size: {batch_size}, num_docs per query: {student_doc_embs.shape[1]}")
 
             # Compute loss with mixed precision
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 loss, metrics = criterion(
                     student_query_emb,
                     teacher_query_emb,
@@ -836,15 +896,13 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
                 metrics.update(router_metrics)
 
             loss = loss / config['gradient_accumulation_steps']
-            scaler.scale(loss).backward()
+            loss.backward()
 
             if (batch_idx + 1) % config['gradient_accumulation_steps'] == 0:
-                # Gradient clipping with scaler
-                scaler.unscale_(optimizer)
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), max_norm=1.0)
 
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -887,6 +945,12 @@ def train_phase2(student_model, teacher_model, config, device, checkpoint_path, 
 
             if is_main_process(rank):
                 logger.info(f"Saved best Phase 2 model with loss: {best_loss:.4f}")
+
+    # Synchronize all ranks before completing (important for compiled models and DDP)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if get_world_size() > 1:
+        torch.distributed.barrier()
 
     if is_main_process(rank):
         logger.info("\nPhase 2 training completed!")

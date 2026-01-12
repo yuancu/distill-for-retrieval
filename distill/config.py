@@ -60,21 +60,21 @@ class TrainingConfig:
         """Get model name based on configuration.
 
         Returns:
-            Model name like 'distilled-mpnet-3584d' or 'distilled-mpnet-768d-mrl'
+            Model name like 'distilled-3584d' or 'distilled-768d-mrl'
         """
         use_projection = self.model['use_projection']
         if use_projection:
             output_dim = self.model['teacher_dim']
-            return f"distilled-mpnet-{output_dim}d"
+            return f"distilled-{output_dim}d"
         else:
             output_dim = self.model['student_dim']
-            return f"distilled-mpnet-{output_dim}d-mrl"
+            return f"distilled-{output_dim}d-mrl"
 
     def get_experiment_name(self) -> str:
         """Get experiment name combining model name and config name.
 
         Returns:
-            Experiment name like 'distilled-mpnet-3584d-default'
+            Experiment name like 'distilled-3584d-default'
         """
         return f"{self.get_model_name()}-{self.config_name}"
 
