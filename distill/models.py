@@ -1,5 +1,9 @@
 """Model architectures for distillation."""
 
+import json
+import os
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -159,3 +163,200 @@ class Router(nn.Module):
                               Higher score = more difficult = should route to teacher
         """
         return self.net(student_query_emb).squeeze(-1)
+
+
+class RoutingModule(nn.Module):
+    """Routes between student and teacher embeddings based on predicted difficulty.
+
+    This module can be used in a SentenceTransformer pipeline:
+    Transformer → Pooling → RoutingModule → Normalize
+
+    The module:
+    1. Receives student embeddings from previous modules
+    2. Uses router to predict query difficulty
+    3. For difficult queries (difficulty > threshold):
+       - Decodes input_ids back to text
+       - Encodes with teacher model
+       - Returns teacher embeddings (truncated to student dim)
+    4. For easy queries: returns student embeddings as-is
+    5. Stores routing decisions in features['routing_decisions']
+    """
+
+    def __init__(
+        self,
+        teacher_model: SentenceTransformer,
+        router: Router,
+        threshold: float,
+        student_dim: int,
+        router_hidden_dim: int = 256
+    ):
+        """Initialize routing module.
+
+        Args:
+            teacher_model: Teacher SentenceTransformer model
+            router: Trained Router for difficulty prediction
+            threshold: Routing threshold (0-1). If difficulty > threshold, use teacher
+            student_dim: Dimension of student embeddings
+            router_hidden_dim: Hidden dimension of router (for saving/loading)
+        """
+        super().__init__()
+
+        # Store components (teacher and router are part of this module's state)
+        self.teacher_model = teacher_model
+        self.router = router
+        self.threshold = threshold
+        self.student_dim = student_dim
+        self.router_hidden_dim = router_hidden_dim
+
+        # Config keys for SentenceTransformer serialization
+        self.config_keys = ['threshold', 'student_dim', 'router_hidden_dim']
+
+        # Set to eval mode
+        self.teacher_model.eval()
+        self.router.eval()
+
+        # Store last routing decisions for access after encoding
+        self.last_routing_decisions = None
+
+    def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Apply routing logic to embeddings.
+
+        Args:
+            features: Dict containing:
+                - 'sentence_embedding': Student embeddings from previous modules
+                - 'input_ids': Tokenized input (for decoding back to text)
+                - 'attention_mask': Attention mask
+                - Optionally 'token_embeddings' from Transformer
+
+        Returns:
+            Dict with updated 'sentence_embedding' (student or teacher)
+            and 'routing_decisions' (boolean tensor)
+        """
+        student_emb = features['sentence_embedding']  # (batch_size, student_dim)
+        batch_size = student_emb.shape[0]
+
+        # Handle case where embeddings are already truncated or have different dim
+        # For router, we need exactly student_dim dimensions
+        if student_emb.shape[1] != self.student_dim:
+            raise ValueError(f"Student embedding mismatch. Expected: {self.student_dim}, actual: {student_emb.shape[1]}")
+        router_input = student_emb
+
+        # Predict difficulty with router (expects unnormalized embeddings)
+        with torch.no_grad():
+            difficulty_scores = self.router(router_input.detach())  # (batch_size,)
+
+        # Determine routing (True = use teacher)
+        use_teacher = difficulty_scores > self.threshold
+
+        # Store routing decisions for access after encoding
+        self.last_routing_decisions = use_teacher.cpu()
+
+        # If no queries need teacher, return student embeddings as-is
+        if not use_teacher.any():
+            features['routing_decisions'] = use_teacher
+            return features
+
+        # For queries routed to teacher, we need to re-encode with teacher
+        # Decode input_ids back to text using the tokenizer
+        if 'input_ids' not in features:
+            # Fallback: if no input_ids, can't re-encode with teacher
+            # Just return student embeddings
+            features['routing_decisions'] = torch.zeros(batch_size, dtype=torch.bool, device=student_emb.device)
+            return features
+
+        # Get tokenizer from teacher model
+        tokenizer = self.teacher_model.tokenizer
+
+        # Decode input_ids back to text
+        input_ids = features['input_ids']
+        texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+
+        # Get indices of sentences to route to teacher
+        teacher_indices = torch.where(use_teacher)[0]
+        teacher_texts = [texts[i] for i in teacher_indices.cpu().numpy()]
+
+        # Encode with teacher
+        with torch.no_grad():
+            teacher_embs = self.teacher_model.encode(
+                teacher_texts,
+                convert_to_tensor=True,
+                normalize_embeddings=False,  # Normalization happens in next module
+                device=student_emb.device,
+                show_progress_bar=False
+            )
+
+        # Truncate teacher embeddings to student_dim
+        teacher_embs = teacher_embs[:, :self.student_dim]
+
+        # Replace student embeddings with teacher embeddings for difficult queries
+        features['sentence_embedding'][teacher_indices] = teacher_embs
+
+        # Add routing decisions to features
+        features['routing_decisions'] = use_teacher
+
+        return features
+
+    def get_sentence_embedding_dimension(self) -> Optional[int]:
+        """Return output dimension (unchanged from input)."""
+        return None  # Doesn't change dimension
+
+    def save(self, output_path: str):
+        """Save the routing module (teacher model, router, config)."""
+        os.makedirs(output_path, exist_ok=True)
+
+        # Save teacher model to subdirectory
+        teacher_path = os.path.join(output_path, 'teacher')
+        self.teacher_model.save(teacher_path)
+
+        # Save router weights
+        router_path = os.path.join(output_path, 'router.pt')
+        torch.save(self.router.state_dict(), router_path)
+
+        # Save config
+        config = {
+            'threshold': float(self.threshold),
+            'student_dim': int(self.student_dim),
+            'router_hidden_dim': int(self.router_hidden_dim),
+        }
+
+        with open(os.path.join(output_path, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=2)
+
+    @staticmethod
+    def load(input_path: str):
+        """Load the routing module from directory.
+
+        Args:
+            input_path: Path to saved routing module
+
+        Returns:
+            RoutingModule instance
+        """
+        # Load config
+        config_path = os.path.join(input_path, 'config.json')
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        # Load teacher model
+        teacher_path = os.path.join(input_path, 'teacher')
+        teacher_model = SentenceTransformer(teacher_path)
+
+        # Load router
+        router = Router(
+            student_dim=config['student_dim'],
+            hidden_dim=config['router_hidden_dim']
+        )
+        router_path = os.path.join(input_path, 'router.pt')
+        state_dict = torch.load(router_path, map_location='cpu', weights_only=True)
+        router.load_state_dict(state_dict)
+
+        # Create and return module
+        module = RoutingModule(
+            teacher_model=teacher_model,
+            router=router,
+            threshold=config['threshold'],
+            student_dim=config['student_dim'],
+            router_hidden_dim=config['router_hidden_dim']
+        )
+
+        return module
