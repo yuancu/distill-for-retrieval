@@ -413,32 +413,7 @@ print(os.listdir("artifacts/distilled-768d-mrl-mpnet"))
 # Should contain: modules.json, config.json, 0_Transformer/, 1_Pooling/, etc.
 ```
 
-## Citation
-
-If you use this framework in your research, please cite:
-
-```bibtex
-@software{distillation_framework,
-  title={Distillation Framework for Retrieval Models},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/yourusername/distill}
-}
-```
-
 ## License
 
-[Add your license here]
+[MIT]
 
-## Additional Documentation
-
-- **Quick Start for Routed Models**: See [QUICKSTART_ROUTED.md](QUICKSTART_ROUTED.md)
-- **Detailed Routing Documentation**: See [ROUTED_MODEL.md](ROUTED_MODEL.md)
-- **Distributed Training Guide**: See [README_DDP.md](README_DDP.md)
-
-## Support
-
-For questions or issues:
-- Open an issue on GitHub
-- Check existing documentation in the `docs/` directory
-- Review example scripts in `examples/`
